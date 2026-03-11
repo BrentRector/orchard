@@ -1,11 +1,11 @@
 """
-woztools — WOZ disk image analysis toolkit for Apple II
+nibbler — WOZ disk image analysis toolkit for Apple II
 
 Analyze copy-protected WOZ disk images, emulate boot processes,
 extract runtime binaries, and convert to standard DSK format.
 
 Usage:
-    python -m woztools <command> <woz_file> [options]
+    python -m nibbler <command> <woz_file> [options]
 
 Commands:
     info      Show WOZ metadata and track map

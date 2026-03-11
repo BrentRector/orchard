@@ -311,15 +311,15 @@ Notable findings:
 
 ---
 
-## Phase 11: Packaging as woztools
+## Phase 11: Packaging as nibbler
 
-The final step was consolidating the ~38 individual scripts into a reusable Python package called `woztools`. The package provides:
+The final step was consolidating the ~38 individual scripts into a reusable Python package called `nibbler`. The package provides:
 
 - **10 modules** covering WOZ file I/O, bit-stream handling, GCR decoding (both 5-and-3 and 6-and-2), 6502 emulation, and disassembly
 - **7 CLI subcommands**: `info`, `scan`, `protect`, `boot`, `decode`, `dsk`, `disasm`
 - Works on any WOZ file, not just Apple Panic
 
-The journey from `woz_reader.py` (a quick script to dump WOZ headers) to `woztools` (a general-purpose WOZ analysis toolkit) mirrors the project itself: each new challenge required a new tool, and eventually there were enough tools that a package structure made sense.
+The journey from `woz_reader.py` (a quick script to dump WOZ headers) to `nibbler` (a general-purpose WOZ analysis toolkit) mirrors the project itself: each new challenge required a new tool, and eventually there were enough tools that a package structure made sense.
 
 ---
 

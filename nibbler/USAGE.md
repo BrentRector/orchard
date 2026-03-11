@@ -1,9 +1,9 @@
-# woztools Usage Guide
+# nibbler Usage Guide
 
 A Python toolkit for analyzing Apple II WOZ disk images. Scans for copy protection, emulates the boot process, extracts runtime binaries, decodes individual sectors, converts to DSK format, and disassembles 6502 code.
 
 ```
-python -m woztools <command> [arguments]
+python -m nibbler <command> [arguments]
 ```
 
 ---
@@ -27,13 +27,13 @@ python -m woztools <command> [arguments]
 Shows the WOZ2 file header, disk type, creator tool, track bit counts, and any half/quarter-track data.
 
 ```
-python -m woztools info <woz_file>
+python -m nibbler info <woz_file>
 ```
 
 **Example:**
 
 ```
-$ python -m woztools info "Apple Panic - Disk 1, Side A.woz"
+$ python -m nibbler info "Apple Panic - Disk 1, Side A.woz"
 
 WOZ2 file: Apple Panic - Disk 1, Side A.woz
   Disk type: 5.25"
@@ -64,13 +64,13 @@ Half/quarter tracks: [1, 5, 6, 7, 9, ...]
 Scans each track for 6-and-2 (16-sector) and 5-and-3 (13-sector) encoded sectors. Reports encoding type, sector counts, and address/data checksum status. Automatically tries non-standard address prologs ($DE instead of $D5).
 
 ```
-python -m woztools scan <woz_file>
+python -m nibbler scan <woz_file>
 ```
 
 **Example:**
 
 ```
-$ python -m woztools scan "Apple Panic - Disk 1, Side A.woz"
+$ python -m nibbler scan "Apple Panic - Disk 1, Side A.woz"
 
 Track    Encoding   6+2   5+3   Addr CK   Data CK  Notes
 ---------------------------------------------------------------------------
@@ -99,8 +99,8 @@ Track    Encoding   6+2   5+3   Addr CK   Data CK  Notes
 Scans all tracks and generates a markdown report of detected copy protection techniques.
 
 ```
-python -m woztools protect <woz_file>
-python -m woztools protect <woz_file> -o report.md
+python -m nibbler protect <woz_file>
+python -m nibbler protect <woz_file> -o report.md
 ```
 
 **Options:**
@@ -123,7 +123,7 @@ python -m woztools protect <woz_file> -o report.md
 Emulates the Apple II boot process: loads the 6-and-2 boot sector from track 0, sets up the P6 ROM environment, and runs the 6502 CPU. You specify a stop address (where the game entry point is), and optionally dump or save memory.
 
 ```
-python -m woztools boot <woz_file> [options]
+python -m nibbler boot <woz_file> [options]
 ```
 
 **Options:**
@@ -137,7 +137,7 @@ python -m woztools boot <woz_file> [options]
 **Example — extract a game binary:**
 
 ```
-$ python -m woztools boot "disk.woz" --stop 0x4000 --dump 0x4000-0xA7FF --save game.bin
+$ python -m nibbler boot "disk.woz" --stop 0x4000 --dump 0x4000-0xA7FF --save game.bin
 
 Booting disk.woz...
 Will stop at $4000
@@ -172,7 +172,7 @@ Saved to game.bin
 Decodes and hex-dumps individual sectors from a specific track. Tries both 6-and-2 and 5-and-3 encoding, including non-standard $DE address prologs.
 
 ```
-python -m woztools decode <woz_file> <track> [options]
+python -m nibbler decode <woz_file> <track> [options]
 ```
 
 **Options:**
@@ -182,7 +182,7 @@ python -m woztools decode <woz_file> <track> [options]
 **Example — hex dump all sectors on track 0:**
 
 ```
-$ python -m woztools decode "disk.woz" 0
+$ python -m nibbler decode "disk.woz" 0
 
 === Track 0, Sector 0 (6+2, checksum: OK) ===
   $0000: 01 A5 27 C9 09 D0 ...
@@ -195,7 +195,7 @@ $ python -m woztools decode "disk.woz" 0
 **Example — extract a single sector to a file:**
 
 ```
-$ python -m woztools decode "disk.woz" 0 --sector 0 -o boot_sector.bin
+$ python -m nibbler decode "disk.woz" 0 --sector 0 -o boot_sector.bin
 ```
 
 ---
@@ -207,8 +207,8 @@ Converts a standard 6-and-2 encoded WOZ image to a 140K DSK file (the format use
 Can also create a bootable DSK from a raw binary file.
 
 ```
-python -m woztools dsk <woz_file> [-o output.dsk]
-python -m woztools dsk --binary game.bin --load-addr 0x4000 --entry-addr 0x4000 [-o output.dsk]
+python -m nibbler dsk <woz_file> [-o output.dsk]
+python -m nibbler dsk --binary game.bin --load-addr 0x4000 --entry-addr 0x4000 [-o output.dsk]
 ```
 
 **Options:**
@@ -220,7 +220,7 @@ python -m woztools dsk --binary game.bin --load-addr 0x4000 --entry-addr 0x4000 
 **Example — convert a WOZ to DSK:**
 
 ```
-$ python -m woztools dsk "standard_disk.woz" -o output.dsk
+$ python -m nibbler dsk "standard_disk.woz" -o output.dsk
 
 Converting standard_disk.woz to DSK...
 DSK image saved: output.dsk (143360 bytes)
@@ -229,7 +229,7 @@ DSK image saved: output.dsk (143360 bytes)
 **Example — create a bootable DSK from an extracted binary:**
 
 ```
-$ python -m woztools dsk --binary game.bin --load-addr 0x4000 --entry-addr 0x4000 -o game.dsk
+$ python -m nibbler dsk --binary game.bin --load-addr 0x4000 --entry-addr 0x4000 -o game.dsk
 
 Bootable DSK created: game.dsk
   Load address: $4000
@@ -246,7 +246,7 @@ Bootable DSK created: game.dsk
 Disassembles a binary file or memory dump as 6502 machine code. Supports both linear (sequential) and recursive descent (follows branches/jumps) modes.
 
 ```
-python -m woztools disasm <binary> [options]
+python -m nibbler disasm <binary> [options]
 ```
 
 **Options:**
@@ -259,7 +259,7 @@ python -m woztools disasm <binary> [options]
 **Example — linear disassembly of a boot sector:**
 
 ```
-$ python -m woztools disasm boot_sector.bin --base 0x0800
+$ python -m nibbler disasm boot_sector.bin --base 0x0800
 
 $0800  00        BRK
 $0801  A0 00     LDY #$00
@@ -270,7 +270,7 @@ $0803  B9 00 08  LDA $0800,Y
 **Example — recursive descent from an entry point:**
 
 ```
-$ python -m woztools disasm game.bin --base 0x4000 --entry 0x4000 -r
+$ python -m nibbler disasm game.bin --base 0x4000 --entry 0x4000 -r
 
 $4000  L_4000          JMP $4065
 ...
@@ -286,17 +286,17 @@ $4067                  STA $C050    ; GR/Text: set graphics mode
 
 ## Module Reference
 
-The `woztools` package can also be used as a Python library:
+The `nibbler` package can also be used as a Python library:
 
 ```python
-from woztools.woz import WOZFile
-from woztools.gcr import find_sectors_62, find_sectors_53, scan_address_fields
-from woztools.cpu import CPU6502
-from woztools.disk import WOZDisk
-from woztools.boot import BootAnalyzer
-from woztools.analyze import CopyProtectionAnalyzer
-from woztools.dsk import woz_to_dsk, create_bootable_dsk
-from woztools.disasm import Disassembler, disassemble_region
+from nibbler.woz import WOZFile
+from nibbler.gcr import find_sectors_62, find_sectors_53, scan_address_fields
+from nibbler.cpu import CPU6502
+from nibbler.disk import WOZDisk
+from nibbler.boot import BootAnalyzer
+from nibbler.analyze import CopyProtectionAnalyzer
+from nibbler.dsk import woz_to_dsk, create_bootable_dsk
+from nibbler.disasm import Disassembler, disassemble_region
 ```
 
 | Module       | Key Classes / Functions                                      |
@@ -318,40 +318,40 @@ from woztools.disasm import Disassembler, disassemble_region
 
 ```bash
 # 1. What's on this disk?
-python -m woztools info disk.woz
+python -m nibbler info disk.woz
 
 # 2. What encoding and how many sectors?
-python -m woztools scan disk.woz
+python -m nibbler scan disk.woz
 
 # 3. Any copy protection?
-python -m woztools protect disk.woz -o protection_report.md
+python -m nibbler protect disk.woz -o protection_report.md
 
 # 4. Look at specific sectors
-python -m woztools decode disk.woz 0
-python -m woztools decode disk.woz 0 --sector 0 -o boot_sector.bin
+python -m nibbler decode disk.woz 0
+python -m nibbler decode disk.woz 0 --sector 0 -o boot_sector.bin
 
 # 5. Disassemble the boot sector
-python -m woztools disasm boot_sector.bin --base 0x0800
+python -m nibbler disasm boot_sector.bin --base 0x0800
 ```
 
 ### Extracting a game binary
 
 ```bash
 # 1. Boot-trace to find where the game loads
-python -m woztools boot disk.woz --stop 0x4000 --dump 0x4000-0xBFFF --save game.bin
+python -m nibbler boot disk.woz --stop 0x4000 --dump 0x4000-0xBFFF --save game.bin
 
 # 2. Disassemble the extracted binary
-python -m woztools disasm game.bin --base 0x4000 --entry 0x4000 -r
+python -m nibbler disasm game.bin --base 0x4000 --entry 0x4000 -r
 
 # 3. Create a bootable DSK for use in emulators
-python -m woztools dsk --binary game.bin --load-addr 0x4000 --entry-addr 0x4000 -o game.dsk
+python -m nibbler dsk --binary game.bin --load-addr 0x4000 --entry-addr 0x4000 -o game.dsk
 ```
 
 ### Converting a standard disk to DSK
 
 ```bash
 # Only works for standard 6-and-2 (16-sector) disks
-python -m woztools dsk standard_disk.woz -o output.dsk
+python -m nibbler dsk standard_disk.woz -o output.dsk
 ```
 
 ---

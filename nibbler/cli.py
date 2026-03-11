@@ -1,8 +1,8 @@
 """
-Command-line interface for woztools.
+Command-line interface for nibbler.
 
 Usage:
-    python -m woztools <command> <woz_file> [options]
+    python -m nibbler <command> <woz_file> [options]
 """
 
 import argparse
@@ -293,7 +293,7 @@ def cmd_disasm(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog='woztools',
+        prog='nibbler',
         description='WOZ disk image analysis toolkit for Apple II'
     )
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
