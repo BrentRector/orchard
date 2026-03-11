@@ -77,8 +77,11 @@ python -m nibbler boot "apple-panic/Apple Panic - Disk 1, Side A.woz" \
 
 | File | Description |
 |------|-------------|
-| [ApplePanic.asm](ApplePanic.asm) | Complete game disassembly (8,378 lines, 104 named subroutines) |
-| [ApplePanic_Boot_T0.asm](ApplePanic_Boot_T0.asm) | Annotated boot sector and RWTS disassembly |
+| [ApplePanic.asm](ApplePanic.asm) | Game code disassembly — tracks 6-13, $4000-$A7FF (8,800+ lines, 104 subroutines) |
+| [ApplePanic_Boot_T0.asm](ApplePanic_Boot_T0.asm) | Track 0 sector data — anti-copy trap, RWTS, byte reconstruction |
+| [ApplePanic_Boot_Stage2.asm](ApplePanic_Boot_Stage2.asm) | Boot RWTS + stage 2 loader — $0200-$03FF, GCR corruption, custom post-decode |
+| [ApplePanic_SecondaryLoader.asm](ApplePanic_SecondaryLoader.asm) | Secondary loader + RWTS — $B600-$BFFF, track reading, marker patching |
+| [ApplePanic_TitleScreen.asm](ApplePanic_TitleScreen.asm) | Title screen code — $1000-$1FFF, RWTS patcher, HGR sprite engine, display |
 | [subroutine_analysis.txt](subroutine_analysis.txt) | Analysis of all 104 game subroutines |
 
 ## Game Architecture
@@ -94,21 +97,21 @@ python -m nibbler boot "apple-panic/Apple Panic - Disk 1, Side A.woz" \
 ## Boot Flow
 
 ```
-P6 Boot ROM
+P6 Boot ROM                              → ApplePanic_Boot_T0.asm
   │  Load 6-and-2 sector 0 → $0800
   ▼
-$0801: Boot Sector
+$0801: Boot Sector                       → ApplePanic_Boot_Stage2.asm
   │  Relocate to $0200, build GCR table
   ▼
-$0301: Stage 2
+$0301: Stage 2                           → ApplePanic_Boot_Stage2.asm
   │  Corrupt GCR table (ASL x3)
   │  Load sectors → $B600-$BFFF
   ▼
-$B700: Secondary Loader
+$B700: Secondary Loader                  → ApplePanic_SecondaryLoader.asm
   │  Read tracks 1-5 → $0800-$48FF
-  │  Patch RWTS: $D5 → $DE
+  │  Patch RWTS: $D5 → $DE              → ApplePanic_TitleScreen.asm
   │  Display title screen
   │  Read tracks 6-13 → $4000-$A7FF
   ▼
-$4000: GAME START
+$4000: GAME START                        → ApplePanic.asm
 ```
