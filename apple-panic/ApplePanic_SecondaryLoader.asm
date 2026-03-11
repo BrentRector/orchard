@@ -5,7 +5,7 @@
 ; This file covers the secondary loader at $B700 and its supporting RWTS
 ; code at $B800-$BFFF, loaded from track 0 sectors 0-9 by the stage 2
 ; loader at $0301. The game code loaded by tracks 6-13 is in ApplePanic.asm.
-; The stage 2 loader itself is in ApplePanic_Boot_T0.asm.
+; The stage 2 loader itself is in ApplePanic_Boot_Stage2.asm.
 ;
 ; BOOT FLOW (this is step 3 of 4):
 ;   1. P6 ROM loads boot sector to $0800, relocates to $0200

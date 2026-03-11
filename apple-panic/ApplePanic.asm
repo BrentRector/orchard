@@ -1,7 +1,7 @@
 ;=============================================================================
 ; APPLE PANIC (1981) - Ben Serki / Broderbund Software
 ; Disassembled from original copy-protected disk
-; (D5 AA B5 / 5-and-3 GCR encoding, custom controller ROM)
+; (dual-format track 0: 6-and-2 boot + 5-and-3 GCR encoding)
 ;
 ; Assembler: Merlin32 syntax
 ; Target: Apple ][+ with 48K RAM
@@ -11,22 +11,13 @@
 ; Disk layout (14 tracks, 5-and-3 GCR / 13 sectors per track):
 ;
 ;   Track 0 — Boot track (DUAL FORMAT: one 6-and-2 sector + thirteen 5-and-3)
-;     6-and-2 S0:  Anti-copy trap ($0800) — crashes if booted by standard ROM
-;     5-and-3 S0:  Configuration data ($0800)
-;     5-and-3 S1:  Data (bad checksum — encrypted or decoy)
-;     5-and-3 S2:  5-and-3 byte reconstruction routine ($0A00)
-;     5-and-3 S3:  Custom RWTS — reads D5 AA B5 addr / D5 AA AD data ($0B00)
-;     5-and-3 S4:  Byte reconstruction completion ($0C00)
-;     5-and-3 S5:  GCR translate / sector skew table ($0D00)
-;     5-and-3 S6:  Data table ($0E00)
-;     5-and-3 S7:  Disk command handler entry ($0F00)
-;     5-and-3 S8:  Seek / track compare ($1000)
-;     5-and-3 S9:  Address field writer ($1100)
-;     5-and-3 S10: GCR data table ($1200)
-;     5-and-3 S11: NOT PRESENT (physical sector is the 6-and-2 anti-copy trap)
-;     5-and-3 S12: Character I/O handler ($1400)
+;     6-and-2 S0:  Boot sector ($0800) — loaded by P6 ROM, relocates to $0200
+;     5-and-3 S0-S9: Loaded by stage 2 to $B600-$BFFF (secondary loader + RWTS)
+;     5-and-3 S1:  Secondary loader entry ($B700, checksum OK with bit-doubling)
+;     5-and-3 S10-S12: Not used by boot loader (S11 has intentionally bad checksum)
 ;     Stage 2 loader at $0301 corrupts GCR table, loads S0-S9 to $B600-$BFFF
-;     See ApplePanic_Boot_T0.asm for full boot sector and RWTS disassembly
+;     See ApplePanic_Boot_Stage2.asm for boot RWTS and stage 2 code
+;     See ApplePanic_SecondaryLoader.asm for secondary loader and RWTS at $B600+
 ;
 ;   Tracks 1-5 — Intermediate loader + title screen (65 sectors -> $0800-$48FF)
 ;     Address markers: $DE $AA $xx (third byte varies per track)

@@ -19,10 +19,10 @@
 ;    $B600-$BFFF using custom post-decode at $0346
 ; 7. JMP ($003E) = JMP $B700 transfers to secondary loader
 ;
-; NOTE: The boot sector on disk crashes if loaded by the STANDARD P6 Boot ROM
-; because BNE at $080A targets $0800 (= BRK). The original disk ships with a
-; CUSTOM controller ROM that reads D5 AA B5 (13-sector / 5-and-3) format.
-; See ApplePanic_Boot_T0.asm for the anti-copy trap and track 0 sector map.
+; Track 0 is DUAL FORMAT: one 6-and-2 sector (read by the standard P6 Boot
+; ROM) plus thirteen 5-and-3 sectors. The P6 ROM loads the 6-and-2 boot
+; sector to $0800 and JMPs to $0801; the boot code here then reads 5-and-3.
+; See ApplePanic_Boot_T0.asm for the track 0 sector map.
 ; See ApplePanic.asm for the game code loaded by tracks 6-13.
 ;
 ; SECTIONS:

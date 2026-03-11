@@ -2,60 +2,82 @@
 ; Apple Panic — Track 0 Boot Code and Copy Protection
 ; Disassembled from WOZ disk image (Apple Panic - Disk 1, Side A.woz)
 ;
-; This file covers track 0: the boot sector, custom RWTS, and the stage 2
-; loader that reads tracks 1-5 and establishes the secondary loader at $B700.
+; This file covers track 0: the dual-format boot sector, RWTS code, and
+; sector data that establishes the secondary loader at $B700.
 ; The game code loaded by tracks 6-13 is in ApplePanic.asm.
 ;
 ; BOOT PROCESS:
-; 1. Standard Disk II boot ROM ($C600) finds D5 AA 96 T0 S0, decodes 6-and-2,
+; 1. Standard P6 Boot ROM (341-0027) finds D5 AA 96 sector 0, decodes 6-and-2,
 ;    loads 256 bytes to $0800, JMPs to $0801.
-; 2. The D5 AA 96 sector 0 is an ANTI-COPY TRAP: the BNE at $080A targets
-;    $0800 (= BRK), so the code crashes after copying one byte.
-; 3. The original disk ships with a CUSTOM controller ROM that reads D5 AA B5
-;    (13-sector) address fields with 5-and-3 GCR encoding instead.
-; 4. The custom ROM loads track 0 sectors to $0800+N*$100 and transfers control
-;    to the boot code, which uses the RWTS at $0B00 to read further tracks.
+; 2. Boot code at $0801 relocates itself from $0800 to $0200, freeing $0800
+;    for the GCR decode table, then JMPs to $020F.
+; 3. GCR table builder at $020F constructs the 5-and-3 decode table at $0800.
+; 4. Boot RWTS at $0200 reads 5-and-3 sector 0 into $0300-$03FF (stage 2).
+; 5. Stage 2 at $0301 corrupts GCR table (ASL x3), loads sectors 0-9 to
+;    $B600-$BFFF, then JMP ($003E) = JMP $B700 (secondary loader).
+;    See ApplePanic_Boot_Stage2.asm for the boot RWTS and stage 2 code.
 ;
-; TRACK 0 SECTORS (D5 AA B5 / 5-and-3):
-;   S0  $0800  Configuration data (has $FF padding — see note)
-;   S1  $0900  Data (checksum BAD — possibly encrypted or corrupt)
-;   S2  $0A00  5-and-3 byte reconstruction routine
-;   S3  $0B00  Custom RWTS — reads D5 AA B5 addr + D5 AA AD data
-;   S4  $0C00  Byte reconstruction continued / completion
-;   S5  $0D00  Data table (GCR translate or sector skew)
-;   S6  $0E00  Data table (mostly zeros)
-;   S7  $0F00  Disk command handler entry
-;   S8  $1000  Disk command handler (seek/compare)
-;   S9  $1100  Address field writer (nibble output)
-;   S10 $1200  Data table (GCR translate / sector data)
-;   S11 -----  NOT PRESENT (physical sector is the 6-and-2 anti-copy trap)
-;   S12 $1400  Character I/O handler
+; TRACK 0 LAYOUT:
+;   This is a DUAL-FORMAT track: one 6-and-2 sector + thirteen 5-and-3 sectors.
+;   The P6 Boot ROM reads the 6-and-2 sector; the boot RWTS reads 5-and-3.
+;   Physical sector order: S11, S8, S5, S2, S12, S9, S6, S3, S0, S10, S7, S4, S1
+;
+; 6-and-2 SECTOR (D5 AA 96):
+;   S0  $0800  Boot sector — relocates to $0200, see ApplePanic_Boot_Stage2.asm
+;
+; 5-and-3 SECTORS (D5 AA B5), loaded by stage 2 to $B600-$BFFF:
+;   S0  $B600  5-and-3 GCR translation table (data, not code)
+;   S1  $B700  Secondary loader entry point (checksum OK with bit-doubling)
+;   S2  $B800  5-and-3 encode routine + data field writer
+;   S3  $B900  Address field search (D5/DE AA xx) + 4-and-4 reader
+;   S4  $BA00  GCR decode tables + timing
+;   S5  $BB00  Primary data buffer (256 bytes)
+;   S6  $BC00  Secondary data buffer (154 bytes) + RWTS routines
+;   S7  $BD00  RWTS main entry point (SUB_BD00)
+;   S8  $BE00  Seek routines + address field write setup
+;   S9  $BF00  Address/data field writer routines
+;   S10-S12    Not used by boot loader (S11 has intentionally bad checksum)
+;
+; NOTE: The code below at $0A00-$1400 was disassembled at sector-relative
+; addresses. At runtime, these sectors are loaded by the stage 2 loader to
+; $B600-$BFFF (see ApplePanic_Boot_Stage2.asm and ApplePanic_SecondaryLoader.asm
+; for the code at its runtime addresses).
 ; ============================================================================
 
 
 ; ============================================================================
-; ANTI-COPY TRAP: D5 AA 96 Sector 0 (6-and-2 decoded)
-; This is what the STANDARD Disk II boot ROM loads to $0800.
+; BOOT SECTOR: D5 AA 96 Sector 0 (6-and-2 decoded)
+;
+; This is what the standard P6 Boot ROM (341-0027) loads to $0800.
+; The boot code relocates itself from $0800 to $0200, freeing $0800 for the
+; GCR decode table, then builds the 5-and-3 table and reads 5-and-3 sectors.
+; See ApplePanic_Boot_Stage2.asm for the full boot sector disassembly at its
+; runtime address ($0200-$02FF).
+;
+; NOTE: The hex bytes below were extracted from the 6-and-2 sector on disk.
+; At $0800, the sector count byte ($01) tells the P6 ROM to load 1 sector.
+; After the P6 ROM JMPs to $0801, the boot code copies $0800-$08FF to
+; $0200-$02FF and jumps to the relocated code at $020F.
 ; ============================================================================
             .ORG $0800
 
-trap_sector_count:
-            .byte $00            ; 0800: sector count = 0 (BRK opcode!)
+boot_sector_count:
+            .byte $01            ; 0800: sector count = 1 (P6 ROM loads 1 sector)
 
-; Entry point for standard boot ROM (JMP $0801):
-trap_entry:
-            LDY #$00             ; 0801: A0 00
-            LDY $0800,X          ; 0803: BC 00 08  X=$60 -> reads $0860
-            SHY $0000,X          ; 0806: 9C 00 00  copies to $0060
-            INX                  ; 0809: E8        X=$61
-            BNE trap_sector_count ; 080A: D0 F4    -> $0800 = BRK! TRAP!
-            ; If X somehow reached 0 (impossible on first pass):
-            JMP $000C            ; 080C: 4C 0C 00
+; Entry point for P6 Boot ROM (JMP $0801):
+boot_entry:
+            LDX #$00             ; 0801: A2 00
+:copy_loop
+            LDA $0800,X          ; 0803: BD 00 08  read from $0800
+            STA $0200,X          ; 0806: 9D 00 02  write to $0200
+            INX                  ; 0809: E8
+            BNE :copy_loop       ; 080A: D0 F7     copy all 256 bytes
+            JMP $020F            ; 080C: 4C 0F 02  enter relocated GCR table builder
 
-; Remaining bytes $080F-$08FF contain data that would be copied to zero page
-; IF the loop ran to completion (which it doesn't — BRK fires on iteration 1).
-; Some of this data resembles disk I/O code (LDA $C08C,X patterns at $0868+)
-; suggesting it may be a remnant of the real boot code, or a decoy.
+; Remaining bytes $080F-$08FF are the rest of the boot sector page, which
+; includes the RWTS code, GCR table builder, and post-decode routines.
+; After relocation to $0200, these become the code at $020F-$02FF.
+; See ApplePanic_Boot_Stage2.asm for the complete annotated disassembly.
 
 
 ; ============================================================================
