@@ -1,8 +1,16 @@
 # Orchard
 
-Apple II reverse engineering: copy protection analysis, boot tracing, and binary extraction.
+I always wanted to know how Apple II copy protection actually worked.
 
-Each game gets its own folder with disk images, analysis documents, and disassembled source. The **nibbler** toolkit provides the tools to analyze any WOZ disk image.
+Growing up, I knew certain disks couldn't be copied — you'd run COPYA or Locksmith and the copy would just fail, or worse, it would seem to work and then crash on boot. The protection was down in the disk format itself, in the way bits were laid down on the magnetic surface, but I never understood the specifics. What exactly was different about those bits? What did the boot code do that was so clever? Why couldn't the copiers handle it?
+
+Decades later, I found a [WOZ file](https://applesaucefdc.com/woz/) of *Apple Panic* — one of my favorite idle timewasters from back in the day — captured at the magnetic flux level by modern hardware. A WOZ file preserves everything about the original disk: every bit pattern, every non-standard marker, every copy protection trick, exactly as it existed on the physical media. Unlike a `.dsk` image, which stores only the decoded sector data, a WOZ file gives you the raw bit stream that the drive head would actually see.
+
+I started poking at it. How does this disk boot? What format are the sectors in? Why does it look so weird compared to a standard DOS 3.3 disk?
+
+One thing led to another. I built a WOZ parser, then a GCR decoder, then a full 6502 CPU emulator, then a boot tracer. I hit dead ends — spent hours debugging a checksum failure that turned out to be in my own tooling, not the disk. I discovered nine distinct layers of copy protection, each one defeating a different class of copy tool. I traced 69.8 million emulated CPU instructions from power-on to game start.
+
+Cracked versions of Apple Panic exist — they've been around for decades — but that was never the point. I wanted to understand *why* the disk couldn't be copied, not just play the game. This repo is the result.
 
 ## Games
 
@@ -11,6 +19,8 @@ Each game gets its own folder with disk images, analysis documents, and disassem
 ![Apple Panic Instructions](apple-panic/ApplePanicInstructions.png)
 
 A platformer with **nine layers of copy protection** — dual-format tracks, GCR table corruption, self-modifying code, non-standard address markers, and more. Fully reverse engineered: boot traced, all protection defeated, game binary extracted and disassembled.
+
+Read the full story: [Cracking Open Apple Panic](apple-panic/ReverseEngineeringHistory.md)
 
 ## nibbler — WOZ Disk Analysis Toolkit
 
