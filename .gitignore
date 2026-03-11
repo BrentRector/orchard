@@ -6,10 +6,14 @@ __pycache__/
 dist/
 build/
 
-# Large emulation artifacts (reproducible via woztools)
+# Large emulation artifacts (reproducible via nibbler)
 boot_trace.log
 decoded_sectors/
 emu_*.bin
+**/game_*.bin
+**/lowmem_*.bin
+**/rwts_*.bin
+**/title_*.bin
 
 # IDE / editor
 .vscode/

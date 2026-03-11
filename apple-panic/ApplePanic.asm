@@ -1,14 +1,32 @@
 ;=============================================================================
 ; APPLE PANIC (1981) - Ben Serki / Broderbund Software
-; Clean reconstruction from cracked binary
-; All cracking group artifacts removed
+; Disassembled from original copy-protected disk
+; (D5 AA B5 / 5-and-3 GCR encoding, custom controller ROM)
 ;
 ; Assembler: Merlin32 syntax
-; Target: Apple ][+ with 48K RAM, DOS 3.3
-; Load: BRUN APPLE PANIC (loads at $0000, 43008 bytes)
+; Target: Apple ][+ with 48K RAM
+; Load: Tracks 6-13 loaded to $4000-$A7FF by secondary loader at $B700
+; Entry: $4000 (relocation routine, then JMP GAME_START at $7000)
+;
+; Memory layout after relocation:
+;   $0400-$04FF  Game loop dispatcher (from $4400)
+;   $0500-$07FF  Text page blanks / screen holes (from $4500)
+;   $0800-$097F  Platform tile bitmaps (from $4800)
+;   $0980-$09FF  Loader artifact + padding (from $4980)
+;   $0A00-$0BFF  Character sprite frames (from $4A00)
+;   $0C00-$0D7C  Background theme tiles (from $4C00)
+;   $0D7D-$0FFF  Runtime scratch / enemy spawn tables (from $4D7D)
+;   $1000-$15FF  Enemy sprite data (from $5000)
+;   $1600-$16FF  Sprite transparency masks (from $5600)
+;   $1700-$17FF  Solid fill pattern (from $5700)
+;   $1800-$18FF  Identity table (from $5800)
+;   $1900-$1FFF  Game state variables (from $5900)
+;   $4000-$43FF  Relocation routine + game subroutines (stays in place)
+;   $4400-$44FF  Identity table (overwritten during relocation)
+;   $6000-$A7FF  Main game code and data (stays in place)
 ;
 ; Build verification:
-;   Total size: $A800 (43008) bytes
+;   Image size: $6800 (26624) bytes from $4000-$A7FF
 ;   Game code MD5 ($6000-$A7FF): ffcd8c18f189fdd28894d51b03525083
 ;=============================================================================
 
@@ -43,887 +61,743 @@ KEY_STP1 EQU  $D8             ; 'X' key - stomp/fill
 KEY_STP2 EQU  $C5             ; 'E' key - stomp/fill (alt)
 
 ;=============================================================================
-; ZERO PAGE VARIABLES ($0000-$00FF)
-; Game uses: $00-$09 (pointers), $E0-$E1 (delay/sound)
-; Rest contains Applesoft BASIC state / CHRGET routine
+; RELOCATION ROUTINE ($4000-$4024)
+;
+; Entry point from secondary loader at $B700.
+; This code is unique to the original copy-protected disk and does not
+; exist in the cracked version, which loads the game pre-relocated.
+;
+; Performs two copy operations:
+;   Phase 1: $4400-$44FF -> $0400-$04FF (game loop dispatcher code)
+;     Simultaneously builds an identity table at $4400:
+;     For each Y (0..255): reads $4400+Y, writes to $0400+Y,
+;     then stores Y itself back to $4400+Y.
+;     Result: $0400 has the game loop code, $4400 has table[n]=n.
+;
+;   Phase 2: $4800-$5FFF -> $0800-$1FFF (6144 bytes)
+;     Sprite data, tile data, identity table, display code.
+;     Uses self-modifying loop: INCs on source/dest high bytes
+;     to advance through 24 pages ($48-$5F -> $08-$1F).
+;
+; After relocation, falls through to $4025 which jumps to GAME_START.
 ;=============================================================================
 
-         ORG  $0000
+         ORG  $4000
 
-ENEMY_SPR_LO  DFB $00             ; $00 - Enemy sprite data pointer (low)
-ENEMY_SPR_HI  DFB $11             ; $01 - Enemy sprite data pointer (high)
-HGR_ADDR1_LO  DFB $78             ; $02 - HGR page 1 address (low)
-HGR_ADDR1_HI  DFB $20             ; $03 - HGR page 1 address (high)
-HGR_ADDR2_LO  DFB $78             ; $04 - HGR page 2 address (low)
-HGR_ADDR2_HI  DFB $40             ; $05 - HGR page 2 address (high)
-SPR_OFF_LO    DFB $90             ; $06 - Sprite data offset (low)
-SPR_OFF_HI    DFB $00             ; $07 - Sprite data offset (high)
-PLR_SPR_LO    DFB $C0             ; $08 - Player sprite frame ptr (low)
-PLR_SPR_HI    DFB $60             ; $09 - Player sprite frame ptr (high)
-         HEX BA18000000040D604814007F7FFFFFFF  ; $0A
-         HEX FFFFFF00FFFF00280018000127488004  ; $1A
-         HEX 1A60E30C0DFEFF00FFAA02FF00C61BFD  ; $2A
-         HEX BF9E85B700A700BF00C00108B3D874B7  ; $3A
-         HEX 00080096FDA869FF555200075DD3FFFF  ; $4A
-         HEX FFFFFFFF38DEFFFFFFFFFFFFFF0108AB  ; $5A
-         HEX 16AB16AB160096FFFF0096FFFFFFFFFF  ; $6A
-         HEX 00FFFF0008FFFFFFFFFFFFFFFFFFFF00  ; $7A
-         HEX FFFFFFFFFF034CFF00FFFFFFFFFFFF00  ; $8A
-         HEX 00000088FFFFFF69FF0000D0D1D35501  ; $9A
-         HEX FFFF0009D3AB16E6B8D002E6B9AD0502  ; $AA
-         HEX C93AB00AC920F0EF38E93038E9D06080  ; $BA
-         HEX 4FC75208FFFFFFFFFFFFFFFF00FF007F  ; $CA
-         HEX FFFFFFFFFFFF  ; $DA
-DELAY_PARAM   DFB $FF             ; $E0 - Delay parameter storage
-WALK_SND_PHASE DFB $FF             ; $E1 - Walking sound phase toggle (0/1)
-         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFF01  ; $E2
-         HEX 0000FFFFFFFFF8FF000000FF00FF  ; $F2
+RELOCATE
+         LDY #$00             ; Y = byte counter (0..255)
+;
+; Phase 1: Copy game loop code and build identity table
+;
+RELOC_LOOP1
+         LDA $4400,Y          ; Read game loop code byte
+         STA $0400,Y          ; Write to text page 1 ($0400)
+         TYA                  ; A = current index Y
+         STA $4400,Y          ; Overwrite source with identity: $4400[Y] = Y
+         INY                  ; Next byte
+         BNE RELOC_LOOP1      ; Loop 256 times
+;
+; Phase 2: Copy sprite/tile data ($4800-$5FFF -> $0800-$1FFF)
+; Self-modifying: INC advances page numbers each iteration
+;
+RELOC_LOOP2
+         LDA $4800,Y          ; Source page (self-modified: $48,$49,...,$5F)
+         STA $0800,Y          ; Dest page (self-modified: $08,$09,...,$1F)
+         INY
+         BNE RELOC_LOOP2      ; Copy 256 bytes per page
+         INC RELOC_LOOP2+2    ; Bump source high byte ($48->$49->...)
+         INC RELOC_LOOP2+5    ; Bump dest high byte ($08->$09->...)
+         LDA RELOC_LOOP2+5    ; Read current dest page
+         CMP #$20             ; Reached $20? (done: $1F was last page)
+         BNE RELOC_LOOP2      ; No -> copy next page
+;
+; Relocation complete. Fall through to game startup at $4025.
+;
 
 ;=============================================================================
-; STACK PAGE ($0100-$01FF)
-; Repeating pattern F8 9E FA 98 FD 88 (pre-loaded stack data)
-; Last 30 bytes: residual return addresses from boot chain
-; $103B used as player Y-position variable (self-modifying code)
+; GAME STARTUP BRIDGE ($4025-$402A)
+;
+; The BNE at $4023 fails when the CMP #$20 matches (Z=1), so execution
+; falls through here. BEQ $4028 is always taken, jumping to JMP $7000.
+; The byte at $4027 ($2C = BIT abs) is dead code, never reached.
 ;=============================================================================
 
-         ORG  $0100
-
-;--- Repeating pattern F8 9E FA 98 FD 88 (157 bytes) ---
-STACK_DATA
-         HEX F89EFA98FD88F89EFA98FD88F89EFA98
-         HEX FD88F89EFA98FD88F89EFA98FD88F89E
-         HEX FA98FD88F89EFA98FD88F89EFA98FD88
-         HEX F89EFA98FD88F89EFA98FD88F89EFA98
-         HEX FD88F89EFA98FD88F89EFA98FD88F89E
-         HEX FA98FD88F89EFA98FD88F89EFA98FD88
-         HEX F89EFA98FD88F89EFA98FD88F89EFA98
-         HEX FD88F89EFA98FD88F89EFA98FD88F89E
-         HEX FA98FD88F89EFA98FD88F89EFA98FD88
-         HEX F89EFA98FD88F89EFA98FD88F8
-
-;--- Residual boot chain data (99 bytes at $019D) ---
-STACK_BOOT_RES
-         HEX 98FD88F89EFA98FD88F89EFA98FD88F8
-         HEX 9EFA98FD88F89EFA98FD88F89EFA98FD
-         HEX 88F89EFA98FD88F89EFA98FD88F89EFA
-         HEX 98FD88F89EFA98FD88F89EFA98FD88F8
-         HEX 9EFA98FD88196F1D3E0034710F733A8E
-         HEX 230469FD6FFF710F733A8E1A0469FD6F
-         HEX FFFD88
+         BEQ GAME_JMP         ; Always taken: Z=1 from CMP #$20 match
+         DFB $2C              ; Dead byte: BIT opcode (never executed)
+GAME_JMP
+         JMP $7000            ; -> GAME_START -> JMP GAME_INIT ($7465)
 
 ;=============================================================================
-; DISK I/O CODE ($0200-$03A3) - DOS 3.3 RWTS routines
-; Sector read/write and nibble encode/decode.
-; Resident in RAM from boot; not called during gameplay.
+; GAME SUBROUTINES ($402B-$43FF)
+;
+; These routines are called by the main game code at $6000-$A7FF.
+; They remain at their load addresses (not relocated).
+; Identical between original and cracked versions.
+;
+; Key routines in this region:
+;
+;   PLR_ON_GROUND check ($402B-$4038):
+;     Tests PLR_ON_GROUND flag; if zero, jumps to fall handler.
+;     BIT $004C / BVS $40A8 pattern used for conditional branching.
+;
+;   Sprite frame calculation ($4039-$40E3):
+;     Computes sprite data pointers based on player position and
+;     animation state. Handles walk-right, walk-left, climb,
+;     dig-left, dig-right, and standing poses.
+;     Uses pointer tables at $7A22-$7A35 for pre-shifted frames.
+;
+;   DRAW_PLAYER ($40E4-$4163):
+;     Renders player sprite using OR compositing with HGR page 1.
+;     Calculates HGR address from Y-row, applies pixel shift offset,
+;     then draws 16 rows of 3-byte-wide sprite data.
+;
+;   ERASE_PLAYER ($4164-$41E8):
+;     Erases player sprite using XOR with page 2 background restore.
+;     Same structure as DRAW_PLAYER but uses EOR instead of ORA,
+;     then ORs with page 2 to restore background underneath.
+;
+;   UPDATE_PLAYER ($41E9-$4208):
+;     Full player frame update: calls all subsystems in sequence:
+;     JSR CLEAR_SCREEN, JSR DRAW_FLOORS, JSR DRAW_STATUS_BORDER,
+;     JSR DRAW_PLATFORMS, JSR COPY_HGR_PAGES, etc.
+;
+;   COPY_HGR_PAGES ($4209-$4228):
+;     Copies HGR page 1 ($2000-$3FFF) to page 2 ($4000-$5FFF)
+;     for background snapshot used by XOR sprite restore.
+;
+;   DRAW_STATUS_BORDER ($4224-$4244):
+;     Draws decorative $D5/$AA checkerboard border at rows $B0-$B1.
+;
+;   CLEAR_SCREEN ($429B-$42B8):
+;     Zeros both HGR pages ($2000-$5FFF), then sets graphics mode:
+;     LDA $C050 (graphics), LDA $C057 (hi-res),
+;     LDA $C054 (page 1), LDA $C052 (full screen).
+;
+;   DRAW_PLATFORMS ($42B9-$42DF):
+;     Iterates level map table at $7E6E, calling DRAW_PLAT_TOP and
+;     DRAW_PLAT_BOT for each platform/ladder segment.
+;
+;   DRAW_HOLE ($4311-$438C):
+;     Draws hole tile with depth-based animation frame.
+;     Uses pre-shifted tile data from $7A3A pointer.
+;
+;   DRAW_TIMER_BAR ($4393-$43C7):
+;     Draws 3-row hourglass timer bar at row $B4 using
+;     alternating $D5/$AA pattern with color inversion.
+;
+;   GAME_DELAY ($43D9-$43FF):
+;     CPU burn delay loop with optional walking sound clicks.
+;     Toggles speaker at $C030 based on walking phase.
 ;=============================================================================
 
-         ORG  $0200
-
-RWTS_READ
-         ORA ($A2,X)
-         BRK
-         LDA $0800,X
-         STA $0200,X
-         INX
-         BNE $0203
-         JMP $020F
-         LDY #$AB
-         TYA
-         STA $3C
-         LSR
-         ORA $3C
-         CMP #$FF
-         BNE $0224
-         CPY #$D5
-         BEQ $0224
-         TXA
-         STA $0800,Y
-         INX
-         INY
-         BNE $0211
-         STY $3D
-         STY $26
-         LDA #$03
-         STA $27
-         LDX $2B
-         JSR $025D
-         JSR $02D1
-         LDA #$A9
-         STA $031F
-         LDA #$02
-         STA $0320
-         JMP $0301
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         BRK
-         CLC
-         PHP
-         LDA $C08C,X
-         BPL $025F
-         EOR #$D5
-         BNE $025F
-         LDA $C08C,X
-         BPL $0268
-         CMP #$AA
-         BNE $0264
-         NOP
-         LDA $C08C,X
-         BPL $0272
-         CMP #$B5
-         BEQ $0284
-         PLP
-         BCC $025D
-         EOR #$AD
-         BEQ $02A1
-         BNE $025D
-         LDY #$03
-         STY $2A
-         LDA $C08C,X
-         BPL $0288
-         ROL
-         STA $3C
-         LDA $C08C,X
-         BPL $0290
-         AND $3C
-         DEY
-         BNE $0288
-         PLP
-         CMP $3D
-         BNE $025D
-         BCS $025E
-         LDY #$9A
-         STY $3C
-         LDY $C08C,X
-         BPL $02A5
-         EOR $0800,Y
-         LDY $3C
-         DEY
-         STA $0800,Y
-         BNE $02A3
-         STY $3C
-         LDY $C08C,X
-         BPL $02B7
-         EOR $0800,Y
-         LDY $3C
-         STA ($26),Y
-         INY
-         BNE $02B5
-         LDY $C08C,X
-         BPL $02C6
-         EOR $0800,Y
-         BNE $025D
-         RTS
-         TAY
-L_02D2
-         LDX #$00
-L_02D4
-         LDA $0800,Y
-         LSR
-         ROL $03CC,X
-         LSR
-         ROL $0399,X
-         STA $3C
-         LDA ($26),Y
-         ASL
-         ASL
-         ASL
-         ORA $3C
-         STA ($26),Y
-         INY
-         INX
-         CPX #$33
-         BNE L_02D4
-         DEC $2A
-         BNE L_02D2
-         CPY $0300
-         BNE L_02FC
-         RTS
-         BRK
-         BRK
-L_02FC
-         JMP $FF2D
-         BRK
-         STA $00B9,Y
-         PHP
-         ASL
-         ASL
-         ASL
-         STA $0800,Y
-         INY
-         BNE $0301
-         LDX $2B
-         LDA #$09
-         STA $27
-         LDA $03CC
-         STA $41
-         STY $40
-         TXA
-         LSR
-         LSR
-         LSR
-         LSR
-         LDA #$02
-         STA $3F
-         LDA #$5D
-         STA $3E
-         JSR $0343
-         JSR $0346
-         LDA $3D
-         EOR $03FF
-         BEQ $033A
-         INC $41
-         INC $3D
-         BNE $0327
-         STA $3E
-         LDA $03CC
-         STA $3F
-         INC $3F
-         JMP ($003E)
-         LDX #$32
-         LDY #$00
-         LDA $0800,X
-         LSR
-         LSR
-         LSR
-         STA $3C
-         LSR
-         STA $2A
-         LSR
-         ORA $0900,X
-         STA ($40),Y
-         INY
-         LDA $0833,X
-         LSR
-         LSR
-         LSR
-         LSR
-         ROL $3C
-         LSR
-         ROL $2A
-         ORA $0933,X
-         STA ($40),Y
-         INY
-         LDA $0866,X
-         LSR
-         LSR
-         LSR
-         LSR
-         ROL $3C
-         LSR
-         ROL $2A
-         ORA $0966,X
-         STA ($40),Y
-         INY
-         LDA $2A
-         AND #$07
-         ORA $0999,X
-         STA ($40),Y
-         INY
-         LDA $3C
-         AND #$07
-         ORA $09CC,X
-         STA ($40),Y
-         INY
-         DEX
-         BPL $034A
-         LDA $0899
-         LSR
-         LSR
-         LSR
-         ORA $09FF
-         STA ($40),Y
-         LDX $2B
-
-;--- RWTS Padding ($03A4-$03FF) ---
-; Unused bytes after RWTS code; mostly $FF with a few residual values
-RWTS_PAD
-         RTS                            ; end of RWTS
-         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
-         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
-         HEX FFFFFFFFFFFFFFB6FFFFFFFFFFFFFFFF
-         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
-         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
-         HEX FFFFFFFFFFFFFFFFFFFFFF09  ; residual boot chain data
+         HEX 7CF006AC267AAE277A840886096018AC
+         HEX 247AAE257AAD657CF006AC287AAE297A
+         HEX 840886096018AC2E7AAE2F7AAD107A4A
+         HEX 9006AC347AAE357A8408860960000018
+         HEX 20197DAD0D7AAC0E7A8D057A8C067A20
+         HEX 6D7AA90085068507AE097A18F00FA506
+         HEX 69308506A90065078507CAD0EE18A506
+         HEX 65088508A5076509850918A9008D1F7A
+         HEX 18203C7AA000A502186D0A7A850218B1
+         HEX 02A20001089102A50869018508A50969
+         HEX 008509C8C003D0E6EE057AEE1F7AAD1F
+         HEX 7AC910D0CB60188D077A8C087AA0FF18
+         HEX C8B96E7EF029CD087AF0034CE67C18AD
+         HEX 077AD97E7EF01090E618AD077AD98E7E
+         HEX F009B0DBA9036018A9016018A90260A9
+         HEX 0060AD107AC901D00420D57B60C902D0
+         HEX 0420ED7B60C903D00420057C60C904D0
+         HEX 0420057C60C907D004201E7C60C906D0
+         HEX 0420357C60C909D004201E7C60C908D0
+         HEX 0420357C60204C7C601820197DAD0D7A
+         HEX AC0E7A8D057A8C067A206D7AA9008506
+         HEX 8507AE097AF01018A50669308506A900
+         HEX 65078507CAD0F018A50665088508A507
+         HEX 6509850918A9008D1F7A18203C7AA000
+         HEX A5026D0A7A8502A504186D0A7A850418
+         HEX B102A2004108AE3B80F00211049102A5
+         HEX 0869018508A50969008509C8C003D0DF
+         HEX EE057AEE1F7AAD1F7AC910D0BD60209E
+         HEX 7E20637F20407E20C47E201D7E209383
+         HEX 20C3804C388A20097E20C683A92020D3
+         HEX 7F601820607D20B47A98F0038D107A8D
+         HEX 0F7A20667C60A9208503A9408505A900
+         HEX 85028504A00018B1029104C8D0F8E603
+         HEX E605A503C940D0EE6018A9B08D057A20
+         HEX 3C7AA027A9D5910288A9AA91028810F4
+         HEX A9B18D057A203C7AA027A9D5910288A9
+         HEX AA91028810F460041424284058608204
+         HEX 000000000000000F4F0F4F0F2F0F4F8F
+         HEX 008F00000000006F6F2F8FAF8F2FAFAF
+         HEX 00AF000000000018A9208503A9008502
+         HEX A000189102C8D0FAE603A603E060D0F0
+         HEX AD50C0AD57C0AD54C0AD52C06018A000
+         HEX 8CDF7E18B96E7EF00C20E07EEEDF7EAC
+         HEX DF7E4CCA7E600400098D067AB97E7E38
+         HEX E90A188D057A206D7A18AD097A0A0A8D
+         HEX DD7E20197F20197F18203E7F203E7F20
+         HEX 197F20197F18ACDF7EB98E7ECD057AD0
+         HEX E76018EE057A203C7AA9038DDE7EAC0A
+         HEX 7AAEDD7E18BD006F31021D406F9102C8
+         HEX E8CEDE7ED0EE6018EE057A203C7AA903
+         HEX 8DDE7EAC0A7AAEDD7E18BD006F31021D
+         HEX 806F9102C8E8CEDE7ED0EE60A210207F
+         HEX 7FA230207F7FA250207F7FA270207F7F
+         HEX A290207F7F6096928A1869068D7D7F8A
+         HEX 1869028D7E7F8E057A203C7AA000A92A
+         HEX 189102C8A954189102C8C028D0F0E8EC
+         HEX 7E7FD0E2E88E057A203C7AA000A92A18
+         HEX 9102C8C027F009A915189102C84CB47F
+         HEX A955189102E8EC7D7FD0DA6085E0A8AA
+         HEX CAD0FD88D0FAAD3C80D00160A5E1D004
+         HEX E6E1D004A90085E118AD0F7A0A65E1A8
+         HEX 18B90880A0
 
 ;=============================================================================
-; MAIN GAME LOOP DISPATCHER ($0400-$04FF)
-; Executable code in text page 1 area (not displayed in HGR mode).
+; DATA BLOCK: RELOCATED TO $0400-$07FF ($4400-$47FF)
+;
+; During relocation, this 1024-byte block is copied to $0400-$07FF.
+; The first 256 bytes ($4400-$44FF) are then overwritten by the
+; identity table built in Phase 1 of the relocation routine.
+;=============================================================================
+
+;--------------------------------------
+; GAME LOOP DISPATCHER ($4400-$44FF -> $0400)
+; Executable code stored in text page 1 area.
 ; Called from L_74E9: dispatches enemy updates + player processing.
 ; Entry point varies by timer value for speed scaling:
 ;   $0400: 4x enemy updates (timer >= $1E)
 ;   $0403: 3x enemy updates (timer >= $14)
 ;   $0406: 2x enemy updates (timer >= $0A)
 ;   $0409: 1x enemy update  (timer >= $01)
-;=============================================================================
+;--------------------------------------
 
-         ORG  $0400
+         HEX 20238E20238E20238E20238E20097E20
+         HEX DD7F203B7620807320238E20238E2023
+         HEX 8E20238E20097E20DD7F200D9320C683
+         HEX 4C1A7578D0F618B904796018A90060FF
+         HEX FF02AD107A8D3D80AD0D7A291FD013AD
+         HEX 0D7A18690FAC0E7A201A80C900D0164C
+         HEX 758018EE0D7AEE0D7AA9008D3C808D3B
+         HEX 80A005EA60C905F0E9A9FF8D3B80AD0D
+         HEX 7A18690FA8AD0E7A18A20F8818AD0E7A
+         HEX C8CAF02F38F90378100549FF186901C9
+         HEX 06B0E9B90479C905F019C900F015B903
+         HEX 78CD0E7AB00869078D0E7A4CBF80E907
+         HEX 8D0E7AAC3D806018A000981899037899
+         HEX 0479C8D0F66060AD0D7A291FD006AD0E
+         HEX 7A4AB006A900A0001860AD0D7AC9A0B0
+         HEX F3984AB00938AD0E7AE9074C0081AD0E
 
-GAME_LOOP
-         JSR $8E23
-         JSR $8E23
-         JSR $8E23
-         JSR $8E23
-         JSR $7E09
-         JSR $7FDD
-         JSR $763B
-         JSR $7380
-         JSR $8E23
-         JSR $8E23
-         JSR $8E23
-         JSR $8E23
-         JSR $7E09
-         JSR $7FDD
-         JSR $930D
-         JSR $83C6
-         JMP $751A
-         SEI
-         BNE L_042C
-         CLC
-         LDA $7904,Y
-         RTS
-         CLC
-         LDA #$00
-         RTS
-         ISC $02FF,X
-         LDA $7A10
-         STA $803D
-         LDA $7A0D
-         AND #$1F
-         BNE $0462
-         LDA $7A0D
-         CLC
-         ADC #$0F
-         LDY $7A0E
-         JSR $801A
-         CMP #$00
-         BNE $0475
-         JMP $8075
-         CLC
-         INC $7A0D
-         INC $7A0D
-         LDA #$00
-         STA $803C
-         STA $803B
-         LDY #$05
-         NOP
-         RTS
-         CMP #$05
-         BEQ $0462
-         LDA #$FF
-         STA $803B
-         LDA $7A0D
-         CLC
-         ADC #$0F
-         TAY
-         LDA $7A0E
-         CLC
-         LDX #$0F
-         DEY
-         CLC
-         LDA $7A0E
-         INY
-         DEX
-         BEQ $04C3
-         SEC
-         SBC $7803,Y
-         BPL $049F
-         EOR #$FF
-         CLC
-         ADC #$01
-         CMP #$06
-         BCS $048C
-         LDA $7904,Y
-         CMP #$05
-         BEQ $04C3
-         CMP #$00
-         BEQ $04C3
-         LDA $7803,Y
-         CMP $7A0E
-         BCS $04BE
-         ADC #$07
-         STA $7A0E
-         JMP $80BF
-         SBC #$07
-         STA $7A0E
-         LDY $803D
-         RTS
-         CLC
-         LDY #$00
-         TYA
-         CLC
-         STA $7803,Y
-         STA $7904,Y
-         INY
-         BNE $04CB
-         RTS
-         RTS
-         LDA $7A0D
-         AND #$1F
-         BNE $04E4
-         LDA $7A0E
-         LSR
-         BCS $04EA
-         LDA #$00
-         LDY #$00
-         CLC
-         RTS
-         LDA $7A0D
-         CMP #$A0
-         BCS $04E4
-         TYA
-         LSR
-         BCS $04FE
-         SEC
-         LDA $7A0E
-         SBC #$07
-         JMP $8100
-         HEX AD0E
+;--------------------------------------
+; TEXT PAGE 1 DATA ($4500-$47FF -> $0500-$07FF)
+; Blank text screen: $A0 = space character
+; Screen holes: $FF bytes at $x78-$x7F (used by Disk II controller)
+; $0700-$077F: Reused as HGR screen save buffer at runtime
+;--------------------------------------
+
+         HEX 7A1869078D6D82CD1C7AF0D8CD1B7AB0
+         HEX D318AD0D7A690F8D6C82AC6D82201A80
+         HEX C900F007297FC905F0BA60A0FFA20FC8
+         HEX B96E7EF02ACAF027AD6D8238F96E7E10
+         HEX 0549FF186901C909B0E5AD6C82D97E7E
+         HEX F09290DB18D98E7EF08AB0D3189085AC
+         HEX 6C8288A20FAD6D82C8CAF01438F90378
+         HEX 100549FF186901C909B0EAA9004CE080
+         HEX A90660AD0E7A4AB003A90060AD107A4A
+         HEX B009AD0E7A38E9074C9D81AD0E7A1869
+         HEX 07A8AD0D7A18690F201A80602CAD0E7A
+         HEX 8DA8814AB0034CEB818C6C82C001D009
+         HEX 18ADA88169074CCB81ADA88138E907A8
+         HEX 8CA881AD0D7A18690F201A80C905F05C
+         HEX C900F0086868AC107A4CFE7AA90060AD
+         HEX 0D7A18690FACA881201A80C905F008C9
+         HEX 00F0034CE0816018AD0D7A690F8D6C82
+         HEX ACA8818C6D8218AD6C826920188D6C82
+         HEX C9AF9003A90560AC6D82201A80C905F0
+         HEX E5C900D003A905604CE0816018AD0D7A
+         HEX 690F8D6C82ACA8818C6D8218AD6C8269
+         HEX 20188D6C82C9AF9003A90060AC6D8220
+         HEX 1A80C905F0E5C900D003A90060A90160
+         HEX 020E00022F0318A2008E3C80C906F006
+         HEX 8C70824C858220C182EE6F82AD6F82CD
+         HEX BC82D00420DA8260CDBD82D004208E84
+         HEX 60CDBF82D006A9FF8D657C60CDBE82D0
+         HEX 0160CDC082D008A9008D6F828D657C60
+         HEX 020406080AAD0D7A18690FA818A20F88
+         HEX 18C8CAF005B90378D0F68C70826018AC
+         HEX 7082B90378D015AD107A4A900918AD0E
+         HEX 7A69074CF88238AD0E7AE90718990378
+         HEX AE7082FE04798D067AAD0D7A69108D05
+         HEX 7A2011836018206D7AAD3A7A8506AD3B
+         HEX 7A8507AD097A0A0A0A0A8D8A830A186D
+         HEX 8A8308186506850628A50769008507AC
+         HEX 7082B90479290FA818B98B8318650685
+         HEX 06A5076900850718A9068D8983A5068D
+         HEX 6C83A5078D6D83AC0A7AA20318B1042D
+         HEX 7A099102C8EE6C83D003EE6D83CAD0EC
+         HEX EE057A203C7ACE8983D0DC6000007018
+         HEX 120F0C0900810A18A9B48D057AA20318
+         HEX 203C7AA000984A9004A9AAD00318A9D5
+         HEX C0209002497F189102C8C026D0E7EE05
+         HEX 7ACAD0DBA9828D91836018EE9283AD92
+         HEX 83C920F00160CE9183A98238ED91838D
+         HEX 067AA9B48D057AA203206D7AAC097AB9
+         HEX 4584AC0A7A1831029102EE057ACAD0E9
 
 ;=============================================================================
-; TEXT PAGE 1 BLANK SCREEN ($0500-$07FF)
-; $A0 = space, $FF = screen hole bytes (used by Disk II controller)
-; Not displayed during gameplay (HGR mode active)
-; $0700-$0777 reused as HGR screen save buffer at runtime
+; DATA BLOCK: RELOCATED TO $0800-$1FFF ($4800-$5FFF)
+;
+; This 6144-byte block is copied to $0800-$1FFF during Phase 2
+; of the relocation routine. Contains all sprite data, tile patterns,
+; lookup tables, and initialization data used by the game engine.
 ;=============================================================================
 
-         ORG  $0500
+;--------------------------------------
+; PLATFORM TILE BITMAPS ($4800-$497F -> $0800-$097F)
+; 8 pixel-shift variants of platform/ladder tiles.
+; Each variant: 3 bytes/row x 16 rows = 48 bytes.
+; Used by DRAW_PLAT_TOP and DRAW_PLAT_BOT routines.
+;--------------------------------------
 
-TXT_LINE1
-         DS   120,$A0           ; 120 spaces (text line 1a)
-SCRN_HOLE_1
-         HEX 2EFFFFFFFFFFFFFF  ; screen hole (Disk II / peripheral)
-TXT_LINE1B
-         DS   120,$A0           ; 120 spaces (text line 1b)
-SCRN_HOLE_2
-         HEX A0FFFFFFFFFFFFFF  ; screen hole (Disk II / peripheral)
-TXT_LINE2
-         DS   120,$A0           ; 120 spaces (text line 2a)
-SCRN_HOLE_3
-         HEX FFFFFFFFFFFFFFFF  ; screen hole (Disk II / peripheral)
-TXT_LINE2B
-         DS   120,$A0           ; 120 spaces (text line 2b)
-SCRN_HOLE_4
-         HEX 02FFFFFFFFFFFFFF  ; screen hole (Disk II / peripheral)
-HGR_SAVE_BUF
-         DS   120,$A0           ; 120 bytes (reused as HGR screen save buffer)
-SCRN_HOLE_5
-         HEX FFFFFFFFFFFFFFFF  ; screen hole (Disk II / peripheral)
-TXT_LINE3B
-         DS   120,$A0           ; 120 spaces (text line 3b)
-SCRN_HOLE_6
-         HEX FFFFFFFFFFFFFFFF  ; screen hole (Disk II / peripheral)
-
-;=============================================================================
-; PLATFORM TILE BITMAPS ($0800-$097F)
-; 8 bit-shift variants of platform/ladder tiles
-; 48 bytes per shift position (3 bytes wide x 16 rows)
-;=============================================================================
-
-         ORG  $0800
-
-TILE_SHIFT0                      ; Shift 0: platform tile shifted 0 pixel(s) right
-;   3 bytes/row x 16 rows = 48 bytes
+; Shift 0: platform tile shifted 0 pixel(s) right (-> $0800)
          HEX 00007F00007F00007F00007F00007F00
          HEX 007F03607F0F787F7F7F7F7F7F7F7F7F
          HEX 7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F
-TILE_SHIFT1                      ; Shift 1: platform tile shifted 1 pixel(s) right
-;   3 bytes/row x 16 rows = 48 bytes
+
+; Shift 1: platform tile shifted 1 pixel(s) right (-> $0830)
          HEX 01007E01007E01007E01007E01007E01
          HEX 007E07407F1F707F7F7F7F7F7F7F7F7F
          HEX 7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F
-TILE_SHIFT2                      ; Shift 2: platform tile shifted 2 pixel(s) right
-;   3 bytes/row x 16 rows = 48 bytes
+
+; Shift 2: platform tile shifted 2 pixel(s) right (-> $0860)
          HEX 03007C03007C03007C03007C03007C03
          HEX 007C0F007F3F607F7F7F7F7F7F7F7F7F
          HEX 7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F
-TILE_SHIFT3                      ; Shift 3: platform tile shifted 3 pixel(s) right
-;   3 bytes/row x 16 rows = 48 bytes
+
+; Shift 3: platform tile shifted 3 pixel(s) right (-> $0890)
          HEX 07007807007807007807007807007807
          HEX 00781F007E7F407F7F7F7F7F7F7F7F7F
          HEX 7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F
-TILE_SHIFT4                      ; Shift 4: platform tile shifted 4 pixel(s) right
-;   3 bytes/row x 16 rows = 48 bytes
+
+; Shift 4: platform tile shifted 4 pixel(s) right (-> $08C0)
          HEX 0F00700F00700F00700F00700F00700F
          HEX 00703F007C7F017F7F7F7F7F7F7F7F7F
          HEX 7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F
-TILE_SHIFT5                      ; Shift 5: platform tile shifted 5 pixel(s) right
-;   3 bytes/row x 16 rows = 48 bytes
+
+; Shift 5: platform tile shifted 5 pixel(s) right (-> $08F0)
          HEX 1F00601F00601F00601F00601F00601F
          HEX 00607F00787F037E7F7F7F7F7F7F7F7F
          HEX 7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F
-TILE_SHIFT6                      ; Shift 6: platform tile shifted 6 pixel(s) right
-;   3 bytes/row x 16 rows = 48 bytes
+
+; Shift 6: platform tile shifted 6 pixel(s) right (-> $0920)
          HEX 3F00403F00403F00403F00403F00403F
          HEX 00407F01707F077C7F7F7F7F7F7F7F7F
          HEX 7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F
-TILE_SHIFT7                      ; Shift 7: platform tile shifted 7 pixel(s) right
-;   3 bytes/row x 16 rows = 48 bytes
+
+; Shift 7: platform tile shifted 7 pixel(s) right (-> $0950)
          HEX 7F00007F00007F00007F00007F00007F
          HEX 00007F03607F0F787F7F7F7F7F7F7F7F
          HEX 7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F
 
-;--- Loader Artifact ($0980-$09AF) ---
-; Contains 'EDASM.OBJ' text remnant - not used by game
-LOADER_ARTIFACT
+; --- Loader Artifact ($4980 -> $0980) ---
+; Contains 'EDASM.OBJ' text remnant - assembler artifact, not used by game
          HEX 454441534D2E4F424A22009109FA0080
          HEX 000000448001FF95000046800A190800
          HEX 0049008508000000418000FF9500004C
 
-;--- Unused padding ($09B0-$09FF) ---
-         DS   80,$FF
+; --- Unused padding ($49B0 -> $09B0) ---
+         HEX 000000000000FFFFFFFFFFFFFFFFFFFF
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
 
-;=============================================================================
-; CHARACTER SPRITE FRAMES ($0A00-$0BBF)
-; Sprite bitmap data for game characters
-; 7 frames, 64 bytes each (3 bytes wide x 10 rows + padding)
-;=============================================================================
+;--------------------------------------
+; CHARACTER SPRITE FRAMES ($4A00-$4BFF -> $0A00-$0BFF)
+; Sprite bitmap data for game characters.
+; 7 frames, 64 bytes each (3 bytes wide x 10 rows + 34 bytes padding).
+; Frame 0: Standing/idle
+; Frame 1: Walk right frame 1
+; Frame 2: Walk right frame 2 (arms forward)
+; Frame 3: Digging pose
+; Frame 4: Walk right frame 3
+; Frame 5: Walk right frame 4
+; Frame 6: Falling/jumping
+;--------------------------------------
 
-CHAR_FRAME_0                     ; Standing/idle at $0A00
-;   64 bytes: 3 bytes/row x 10 rows + 34 bytes padding
+; Frame 0: Standing/idle (-> $0A00)
          HEX 0000000000001C1C0000000000000000
          HEX 001E1C22221C00000000000000000022
          HEX 1C000000000000003E1E222200000000
          HEX 00000000000000000000000000000000
-CHAR_FRAME_1                     ; Walk frame 1 at $0A40
-;   64 bytes: 3 bytes/row x 10 rows + 34 bytes padding
+
+; Frame 1: Walk frame 1 (-> $0A40)
          HEX 00000000000022220000000000000000
          HEX 00222222222200000000000000000022
          HEX 08000000000000003022222200000000
          HEX 00000000000000000000000000000000
-CHAR_FRAME_2                     ; Walk frame 2 at $0A80
-;   64 bytes: 3 bytes/row x 10 rows + 34 bytes padding
+
+; Frame 2: Walk frame 2 (-> $0A80)
          HEX 00000000000002020000000000000000
          HEX 00222226220200000000000000000022
          HEX 08000000000000003022222600000000
          HEX 00000000000000000000000000000000
-CHAR_FRAME_3                     ; Digging at $0AC0
-;   64 bytes: 3 bytes/row x 10 rows + 34 bytes padding
+
+; Frame 3: Digging (-> $0AC0)
          HEX 0000000000001C023E00000000000000
          HEX 001E222A221C3E00000000000000003E
          HEX 083E000000000000301E222A00000000
          HEX 00000000000000000000000000000000
-CHAR_FRAME_4                     ; Walk frame 3 at $0B00
-;   64 bytes: 3 bytes/row x 10 rows + 34 bytes padding
+
+; Frame 4: Walk frame 3 (-> $0B00)
          HEX 00000000000020020000000000000000
          HEX 00222232222000000000000000000022
          HEX 0800000000000000300A223200000000
          HEX 00000000000000000000000000000000
-CHAR_FRAME_5                     ; Walk frame 4 at $0B40
-;   64 bytes: 3 bytes/row x 10 rows + 34 bytes padding
+
+; Frame 5: Walk frame 4 (-> $0B40)
          HEX 00000000000022220000000000000000
          HEX 00222222222200000000000000000022
          HEX 08000000000000003012222200000000
          HEX 00000000000000000000000000000000
-CHAR_FRAME_6                     ; Falling/jumping at $0B80
-;   64 bytes: 3 bytes/row x 10 rows + 34 bytes padding
+
+; Frame 6: Falling/jumping (-> $0B80)
          HEX 0000000000001C1C0000000000000000
          HEX 001E1C221C1C00000000000000000022
          HEX 1C000000000000003E221C2200000000
          HEX 00000000000000000000000000000000
 
-;--- Empty frame slot ($0BC0-$0BFF) ---
-         DS   64,$00
+; --- Empty frame slot ($4BC0 -> $0BC0) ---
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
 
-;=============================================================================
-; BACKGROUND THEME TILE PATTERNS ($0C00-$0D7C)
-; 4 visual themes, 48 bytes each (3 color layers x 16 bytes)
-; Selected by SELECT_BG_PATTERN based on level/lives
-; Loaded into level map table at $7E6E during level setup
-;=============================================================================
+;--------------------------------------
+; BACKGROUND THEME TILE PATTERNS ($4C00-$4D7C -> $0C00-$0D7C)
+; 4 visual themes (+ 4 duplicates of theme 3)
+; Each theme: 48 bytes (3 color layers x 16 bytes)
+; Selected by SELECT_BG_PATTERN based on level/lives.
+; Loaded into level map table at $7E6E during level setup.
+;--------------------------------------
 
-BG_THEME_0                       ; Theme 0 at $0C00
+; Theme 0 (-> $0C00)
          HEX 04182028305050648000000000000000
          HEX 0F0F8F4F0F2F8F2F0F00000000000000
          HEX AF2FAF8F4F4FAF6FAF00000000000000
-BG_THEME_1                       ; Theme 1 at $0C30
+
+; Theme 1 (-> $0C30)
          HEX 04040430346076825816000000000000
          HEX 0F4F8F2F8F0F2F8F2F6F000000000000
          HEX 2F6FAF6FAF2F6FAFAF8F000000000000
-BG_THEME_2                       ; Theme 2 at $0C60
+
+; Theme 2 (-> $0C60)
          HEX 04142428405860820400000000000000
          HEX 0F4F0F4F0F2F0F4F8F008F0000000000
          HEX 6F6F2F8FAF8F2FAFAF00AF0000000000
-BG_THEME_3                       ; Theme 3 at $0C90
+
+; Theme 3 (-> $0C90)
          HEX 04202035405276000000000000000000
          HEX 0F0F6F8F0F4F0F000000000000000000
          HEX AF4F8FAF2FAFAF000000000000000000
 
-;--- Themes 4-7 (duplicates of theme 3) ---
+; Theme 4 (duplicate of theme 3) (-> $0CC0)
          HEX 04202035405276000000000000000000
          HEX 0F0F6F8F0F4F0F000000000000000000
          HEX AF4F8FAF2FAFAF000000000000000000
+
+; Theme 5 (duplicate of theme 3) (-> $0CF0)
          HEX 04202035405276000000000000000000
          HEX 0F0F6F8F0F4F0F000000000000000000
          HEX AF4F8FAF2FAFAF000000000000000000
+
+; Theme 6 (duplicate of theme 3) (-> $0D20)
          HEX 04202035405276000000000000000000
          HEX 0F0F6F8F0F4F0F000000000000000000
          HEX AF4F8FAF2FAFAF000000000000000000
+
+; Theme 7 (duplicate of theme 3) (-> $0D50)
          HEX 04202035405276000000000000000000
          HEX 0F0F6F8F0F4F0F000000000000000000
-         HEX AF4F8FAF2FAFAF000000000000
+         HEX AF4F8FAF2FAFAF000000000000000000
 
-;=============================================================================
-; CLEARED REGION ($0D7D-$0FFC)
-; Cracker overwrote with EDASM code; zeroed in clean reconstruction.
-; $0E00-$0E7F: Enemy spawn position table (populated at runtime)
-;=============================================================================
+;--------------------------------------
+; RUNTIME SCRATCH AREA ($4D7D-$4FFF -> $0D7D-$0FFF)
+; Contains residual DOS code that is overwritten at runtime.
+; $0E00-$0E7F: Enemy spawn position table (populated during level setup)
+;--------------------------------------
 
-         ORG  $0D7D
-         DS   131,$00          ; $0D7D-$0DFF: padding
-ENEMY_SPAWN_TBL                  ; $0E00: enemy X/Y positions per level config
-         DS   128,$00          ; 4 configs x 8 enemies x 2 bytes (X,Y)
-         DS   381,$00          ; $0E80-$0FFC: runtime scratch
+         HEX 000000C98DD0F560A98DC512F0034C2C
+         HEX 0DA9008501201C0D8500F00CC928D005
+         HEX 20770DA5004C0013A9A0A2109DB803CA
+         HEX 10FAA97F855B207E0FA98D8DC60FA900
+         HEX 8DC70F20840FA20638CA3016BDC30329
+         HEX 3FF86900D8C9409002497009809DC303
+         HEX B0E720810FA9AC8DC60FA9A08DC70F20
+         HEX 840F207E0F20870FA002A670E00D900E
+         HEX B9700010464086806630065046208670
+         HEX 26502640267086106630065046208670
+         HEX 26502670462086506640063046608630
+         HEX 26500610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26508612C98DF0F4D0DAA512C98DF01A
+         HEX A0008410BD0002E8C98DF00EC512F00C
+         HEX 208D0EC610D0ED4C2C0DCA18A9004C8D
+         HEX 0EA9208510A001845CD007A000845C20
+         HEX 120D20280E9004A45CF017C610F0D820
+         HEX 730FC9FFF0E5C900D008A45C30C9A0FF
+         HEX 30DBA9FF208D0E208D0ECAA9008518A9
+         HEX 0885194CB90C20860EA51238E9AD4C8D
+         HEX 0EA2002CA2082CA2102CA2772CA283BD
+         HEX A00FF00620EDFDE8D0F560208C0FA26E
+         HEX 4C8C0F8D84C2CCCFC1C4008D84C2D3C1
+         HEX D6C500C1D3CDC9C4D3D4C1CDD0ACD3B6
+         HEX ACC4B1ACC1A4B3C2B88D00CCB1B78D00
+         HEX C3CDC4A0D3D9CED4C1D800CED5CDC5D2
+         HEX C9C3A0CFD6C5D2C6CCCFD700D0C1D2C1
+         HEX CDC5D4C5D2A8D3A9A0CFCDC9D4D4C5C4
+         HEX 00D5CE
 
-;=============================================================================
-; ENEMY SPRITE DATA ($0FFD-$15FF)
-; 3 enemy types, 512 bytes each (8 shift variants x 2 frames)
+;--------------------------------------
+; ENEMY SPRITE DATA ($4FFD-$55FF -> $0FFD-$15FF)
+; 3 enemy types, 512 bytes each (8 shift variants x 2 anim frames)
 ; 3 bytes wide x 10 rows = 30 bytes per shifted frame
-;=============================================================================
+; Type 0: Bug    (-> $1000)
+; Type 1: Spider (-> $1200)
+; Type 2: Ghost  (-> $1400)
+;--------------------------------------
 
-         ORG  $0FFD
+; Padding/alignment bytes (-> $0FFD)
+         HEX 00D5CE
 
-         HEX 00D5CE             ; padding/alignment
-
-ENEMY_TYPE0_SPR                   ; Bug sprites at $1000
-;--- shift 0, anim 0 at $1000 ---
+; Bug sprites (-> $1000)
+;   shift 0, anim 0 (-> $1000)
          HEX 85A88091A280908280A08180A8858092
          HEX 9080929080829080AA9580A291800000
-;--- shift 0, anim 1 at $1020 ---
+;   shift 0, anim 1 (-> $1020)
          HEX 8AD080A2C480A08480C08280D08A80A4
          HEX A080A4A08084A080D4AA80A0A2800000
-;--- shift 1, anim 0 at $1040 ---
+;   shift 1, anim 0 (-> $1040)
          HEX 94A081C48881C08880808580A09580C8
          HEX C080C8C08088C080A8D58088C5800000
-;--- shift 1, anim 1 at $1060 ---
+;   shift 1, anim 1 (-> $1060)
          HEX A8C082889182809180808A80C0AA8090
          HEX 8181908181908081D0AA81908A810000
-;--- shift 2, anim 0 at $1080 ---
+;   shift 2, anim 0 (-> $1080)
          HEX D0808590A28480A28080948080D580A0
          HEX 8282A08282A08082A0D582A094820000
-;--- shift 2, anim 1 at $10A0 ---
+;   shift 2, anim 1 (-> $10A0)
          HEX A0818AA0C48880C48080A88080AA81C0
          HEX 8484C08484C08084C0AA85C0A8840000
-;--- shift 3, anim 0 at $10C0 ---
+;   shift 3, anim 0 (-> $10C0)
          HEX C08294C0889180888180D08080D48280
          HEX 898880898880818880D58A80D1880000
-;--- shift 3, anim 1 at $10E0 ---
+;   shift 3, anim 1 (-> $10E0)
          HEX 8085A88091A280908280A08180A88580
          HEX 929080929080829080AA9580A2910000
-;--- shift 4, anim 0 at $1100 ---
+;   shift 4, anim 0 (-> $1100)
          HEX 81A08081A08095AA80A08180A8858082
          HEX 9280829280829080AA95808884800000
-;--- shift 4, anim 1 at $1120 ---
+;   shift 4, anim 1 (-> $1120)
          HEX 82C08082C080AAD480C08280D08A8084
          HEX A48084A48084A080D4AA809088800000
-;--- shift 5, anim 0 at $1140 ---
+;   shift 5, anim 0 (-> $1140)
          HEX 848081848081D4A881808580A0958088
          HEX C88088C88088C080A8D580A090800000
-;--- shift 5, anim 1 at $1160 ---
+;   shift 5, anim 1 (-> $1160)
          HEX 888082888082A8D182808A80C0AA8090
          HEX 9081909081908081D0AA81C0A0800000
-;--- shift 6, anim 0 at $1180 ---
+;   shift 6, anim 0 (-> $1180)
          HEX 908084908084D0A28580948080D580A0
          HEX A082A0A082A08082A0D58280C1800000
-;--- shift 6, anim 1 at $11A0 ---
+;   shift 6, anim 1 (-> $11A0)
          HEX A08088A08088A0C58A80A88080AA81C0
          HEX C084C0C084C08084C0AA858082810000
-;--- shift 7, anim 0 at $11C0 ---
+;   shift 7, anim 0 (-> $11C0)
          HEX C08090C08090C08A9580D08080D48280
          HEX 818980818980818880D58A8084820000
-;--- shift 7, anim 1 at $11E0 ---
+;   shift 7, anim 1 (-> $11E0)
          HEX 8081A08081A08095AA80A08180A88580
          HEX 829280829280829080AA958088840000
 
-ENEMY_TYPE1_SPR                   ; Spider sprites at $1200
-;--- shift 0, anim 0 at $1200 ---
+; Spider sprites (-> $1200)
+;   shift 0, anim 0 (-> $1200)
          HEX 0810000810002A54002A540012490002
          HEX 41002A5500281500A894808AD0800000
-;--- shift 0, anim 1 at $1220 ---
+;   shift 0, anim 1 (-> $1220)
          HEX 10200010200054280154280124120104
          HEX 0201542A01502A00D0A88094A0810000
-;--- shift 1, anim 0 at $1240 ---
+;   shift 1, anim 0 (-> $1240)
          HEX 20400020400028510228510248240208
          HEX 0402285502205500A0D180A8C0820000
-;--- shift 1, anim 1 at $1260 ---
+;   shift 1, anim 1 (-> $1260)
          HEX 40000140000150220550220510490410
          HEX 0804502A05402A01C0A281D080850000
-;--- shift 2, anim 0 at $1280 ---
+;   shift 2, anim 0 (-> $1280)
          HEX 00010200010220450A20450A20120920
          HEX 100820550A00550280C582A0818A0000
-;--- shift 2, anim 1 at $12A0 ---
+;   shift 2, anim 1 (-> $12A0)
          HEX 000204000204400A15400A1540241240
          HEX 2010402A15002A05808A85C082940000
-;--- shift 3, anim 0 at $12C0 ---
+;   shift 3, anim 0 (-> $12C0)
          HEX 00040800040800152A00152A00492400
          HEX 412000552A00540A80948A8085A80000
-;--- shift 3, anim 1 at $12E0 ---
+;   shift 3, anim 1 (-> $12E0)
          HEX 000810000810002A54002A5400124900
          HEX 0241002A5500281580A894808AD00000
-;--- shift 4, anim 0 at $1300 ---
+;   shift 4, anim 0 (-> $1300)
          HEX 0240000A50000A50002A540002410012
          HEX 49002A5500281500A89480A084800000
-;--- shift 4, anim 1 at $1320 ---
+;   shift 4, anim 1 (-> $1320)
          HEX 04000114200114200154280104020124
          HEX 1201542A01502A00D0A880C088800000
-;--- shift 5, anim 0 at $1340 ---
+;   shift 5, anim 0 (-> $1340)
          HEX 08000228400228400228510208040248
          HEX 2402285502205500A0D1808091800000
-;--- shift 5, anim 1 at $1360 ---
+;   shift 5, anim 1 (-> $1360)
          HEX 10000450000550000550220510080410
          HEX 4904502A05402A01C0A28180A2800000
-;--- shift 6, anim 0 at $1380 ---
+;   shift 6, anim 0 (-> $1380)
          HEX 20000820010A20010A20450A20100820
          HEX 120920550A00550280C58280C4800000
-;--- shift 6, anim 1 at $13A0 ---
+;   shift 6, anim 1 (-> $13A0)
          HEX 400010400214400214400A1540201040
          HEX 2412402A15002A05808A858088810000
-;--- shift 7, anim 0 at $13C0 ---
+;   shift 7, anim 0 (-> $13C0)
          HEX 00012000052800052800152A00412000
          HEX 492400552A00540A80948A8090820000
-;--- shift 7, anim 1 at $13E0 ---
+;   shift 7, anim 1 (-> $13E0)
          HEX 000240000A50000A50002A5400024100
          HEX 1249002A5500281580A89480A0840000
 
-ENEMY_TYPE2_SPR                   ; Ghost sprites at $1400
-;--- shift 0, anim 0 at $1400 ---
+; Ghost sprites (-> $1400)
+;   shift 0, anim 0 (-> $1400)
          HEX 81A08085A88085A880A5A980A4898084
          HEX 8880948A80C48880C1A08081A0800000
-;--- shift 0, anim 1 at $1420 ---
+;   shift 0, anim 1 (-> $1420)
          HEX 82C0808AD0808AD080CAD280C8928088
          HEX 9080A8948088918082C18082C0800000
-;--- shift 1, anim 0 at $1440 ---
+;   shift 1, anim 0 (-> $1440)
          HEX 84808194A08194A08194A58190A58090
          HEX A080D0A88090A2808482818480810000
-;--- shift 1, anim 1 at $1460 ---
+;   shift 1, anim 1 (-> $1460)
          HEX 888082A8C082A8C082A8CA82A0CA80A0
          HEX C080A0D180A0C4808884828880820000
-;--- shift 2, anim 0 at $1480 ---
+;   shift 2, anim 0 (-> $1480)
          HEX 908084D08085D08085D09485C09481C0
          HEX 8081C0A281C088819088849080840000
-;--- shift 2, anim 1 at $14A0 ---
+;   shift 2, anim 1 (-> $14A0)
          HEX A08088A0818AA0818AA0A98A80A98280
          HEX 818280C582809182A09088A080880000
-;--- shift 3, anim 0 at $14C0 ---
+;   shift 3, anim 0 (-> $14C0)
          HEX C08090C08294C08294C0D29480D28480
          HEX 8284808A8580A284C0A090C080900000
-;--- shift 3, anim 1 at $14E0 ---
+;   shift 3, anim 1 (-> $14E0)
          HEX 8081A08085A88085A880A5A980A48980
          HEX 848880948A80C48880C1A08081A00000
-;--- shift 4, anim 0 at $1500 ---
+;   shift 4, anim 0 (-> $1500)
          HEX 848880948A8095AA8095AA80A48980A4
          HEX 8980948A80C48880D082809082800000
-;--- shift 4, anim 1 at $1520 ---
+;   shift 4, anim 1 (-> $1520)
          HEX 889080A89480AAD480AAD480C89280C8
          HEX 9280A89480889180A08580A084800000
-;--- shift 5, anim 0 at $1540 ---
+;   shift 5, anim 0 (-> $1540)
          HEX 90A080D0A880D4A881D4A88190A58090
          HEX A580D0A88090A280C08A80C088800000
-;--- shift 5, anim 1 at $1560 ---
+;   shift 5, anim 1 (-> $1560)
          HEX A0C080A0D180A8D182A8D182A0CA80A0
          HEX CA80A0D180A0C4808095808091800000
-;--- shift 6, anim 0 at $1580 ---
+;   shift 6, anim 0 (-> $1580)
          HEX C08081C0A281D0A285D0A285C09481C0
          HEX 9481C0A281C0888180AA8080A2800000
-;--- shift 6, anim 1 at $15A0 ---
+;   shift 6, anim 1 (-> $15A0)
          HEX 80818280C582A0C58AA0C58A80A98280
          HEX A98280C58280918280D48080C4800000
-;--- shift 7, anim 0 at $15C0 ---
+;   shift 7, anim 0 (-> $15C0)
          HEX 808284808A85C08A95C08A9580D28480
          HEX D284808A8580A28480A8818088810000
-;--- shift 7, anim 1 at $15E0 ---
+;   shift 7, anim 1 (-> $15E0)
          HEX 80848880948A8095AA8095AA80A48980
          HEX A48980948A80C48880D0828090820000
 
-;=============================================================================
-; SPRITE TRANSPARENCY MASKS ($1600-$16FF)
-; AND mask for background preservation during enemy rendering
-; 8 shift variants x 30 bytes = 240 bytes of mask data
-;=============================================================================
+;--------------------------------------
+; SPRITE TRANSPARENCY MASKS ($5600-$56FF -> $1600-$16FF)
+; AND mask for background preservation during enemy rendering.
+; 8 shift variants x 30 bytes = 240 bytes of mask data.
+; Remaining 16 bytes are padding.
+;--------------------------------------
 
-SPR_MASK_SHIFT0                  ; Mask shift 0
+; Mask shift 0 (-> $1600)
          HEX 00407F00407F00407F00407F00407F00
-         HEX 407F00407F00407F00407F00407F7F7F
-SPR_MASK_SHIFT1                  ; Mask shift 1
-         HEX 01007F01007F01007F01007F01007F01
-         HEX 007F01007F01007F01007F01007F7F7F
-SPR_MASK_SHIFT2                  ; Mask shift 2
-         HEX 03007E03007E03007E03007E03007E03
-         HEX 007E03007E03007E03007E03007E7F7F
-SPR_MASK_SHIFT3                  ; Mask shift 3
-         HEX 07007C07007C07007C07007C07007C07
-         HEX 007C07007C07007C07007C07007C7F7F
-SPR_MASK_SHIFT4                  ; Mask shift 4
-         HEX 0F00780F00780F00780F00780F00780F
-         HEX 00780F00780F00780F00780F00787F7F
-SPR_MASK_SHIFT5                  ; Mask shift 5
-         HEX 1F00701F00701F00701F00701F00701F
-         HEX 00701F00701F00701F00701F00707F7F
-SPR_MASK_SHIFT6                  ; Mask shift 6
-         HEX 3F00603F00603F00603F00603F00603F
-         HEX 00603F00603F00603F00603F00607F7F
-SPR_MASK_SHIFT7                  ; Mask shift 7
-         HEX 7F00407F00407F00407F00407F00407F
+         HEX 407F00407F00407F00407F00407F
+; Mask shift 1 (-> $161E)
+         HEX 7F7F01007F01007F01007F01007F0100
+         HEX 7F01007F01007F01007F01007F01
+; Mask shift 2 (-> $163C)
+         HEX 007F7F7F03007E03007E03007E03007E
+         HEX 03007E03007E03007E03007E0300
+; Mask shift 3 (-> $165A)
+         HEX 7E03007E7F7F07007C07007C07007C07
+         HEX 007C07007C07007C07007C07007C
+; Mask shift 4 (-> $1678)
+         HEX 07007C07007C7F7F0F00780F00780F00
+         HEX 780F00780F00780F00780F00780F
+; Mask shift 5 (-> $1696)
+         HEX 00780F00780F00787F7F1F00701F0070
+         HEX 1F00701F00701F00701F00701F00
+; Mask shift 6 (-> $16B4)
+         HEX 701F00701F00701F00707F7F3F00603F
+         HEX 00603F00603F00603F00603F0060
+; Mask shift 7 (-> $16D2)
+         HEX 3F00603F00603F00603F00607F7F7F00
+         HEX 407F00407F00407F00407F00407F
+; Padding
          HEX 00407F00407F00407F00407F00407F00
 
-;=============================================================================
-; SOLID FILL PATTERN ($1700-$17FC)
-; Repeating FF FF 00 00 pattern for screen fill operations
-;=============================================================================
-
+;--------------------------------------
+; SOLID FILL PATTERN ($5700-$57FF -> $1700-$17FF)
 ; Repeating 4-byte pattern: FF FF 00 00
-; Used by screen fill routines for striped fill effect
-FILL_PATTERN
-;   63 repetitions of FF FF 00 00 = 252 bytes
-         HEX FFFF0000FFFF0000FFFF0000FFFF0000
-         HEX FFFF0000FFFF0000FFFF0000FFFF0000
-         HEX FFFF0000FFFF0000FFFF0000FFFF0000
-         HEX FFFF0000FFFF0000FFFF0000FFFF0000
-         HEX FFFF0000FFFF0000FFFF0000FFFF0000
-         HEX FFFF0000FFFF0000FFFF0000FFFF0000
-         HEX FFFF0000FFFF0000FFFF0000FFFF0000
-         HEX FFFF0000FFFF0000FFFF0000FFFF0000
-         HEX FFFF0000FFFF0000FFFF0000FFFF0000
-         HEX FFFF0000FFFF0000FFFF0000FFFF0000
-         HEX FFFF0000FFFF0000FFFF0000FFFF0000
-         HEX FFFF0000FFFF0000FFFF0000FFFF0000
-         HEX FFFF0000FFFF0000FFFF0000FFFF0000
-         HEX FFFF0000FFFF0000FFFF0000FFFF0000
-         HEX FFFF0000FFFF0000FFFF0000FFFF0000
-         HEX FFFF0000FFFF0000FFFF0000FF
+; Used by screen fill routines for striped fill effect.
+;--------------------------------------
 
-;=============================================================================
-; IDENTITY LOOKUP TABLE ($1800-$18FF)
-; 256 bytes: $00,$01,$02,...,$FF
-; Used as lookup table via zero-page indirect addressing
-;=============================================================================
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
 
-         ORG  $17FD
-         HEX FF0000             ; padding before table
-IDTABLE                          ; $1800
-; Sequential values $00-$FF used as identity lookup:
+;--------------------------------------
+; IDENTITY LOOKUP TABLE ($5800-$58FF -> $1800-$18FF)
+; Sequential values $00-$FF: table[n] = n
+; Used as lookup table via zero-page indirect addressing:
 ;   LDA (ptr),Y with ptr pointing here returns Y in A
+; Note: The relocation routine also builds a second identity
+; table at $4400 (overwriting the game loop source data).
+;--------------------------------------
+
          HEX 000102030405060708090A0B0C0D0E0F  ; $00-$0F
          HEX 101112131415161718191A1B1C1D1E1F  ; $10-$1F
          HEX 202122232425262728292A2B2C2D2E2F  ; $20-$2F
@@ -941,60 +815,143 @@ IDTABLE                          ; $1800
          HEX E0E1E2E3E4E5E6E7E8E9EAEBECEDEEEF  ; $E0-$EF
          HEX F0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF  ; $F0-$FF
 
+;--------------------------------------
+; GAME STATE VARIABLES ($5900-$5FFF -> $1900-$1FFF)
+; Mostly zeroed at load time. Game initialization populates
+; these during GAME_INIT and LEVEL_SETUP.
+; $5E00-$5FFF ($1E00-$1FFF) contains Applesoft BASIC runtime
+; code (not used by the game, residual from DOS loading).
+;--------------------------------------
+
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000040
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000005
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 9D75AACA10F7ADB1AA8D57AA20D4A7AD
+         HEX B3AAF00948209DA668A0009140205BA7
+         HEX AD5FAAD020A22FBD519E9DD003CA10F7
+         HEX AD539E8DF30349A58DF403AD529E8DF2
+         HEX 03A906D005AD62AAF0068D5FAA4C80A1
+         HEX 604CBF9D4C849D4CFDAA4CB5B7AD0F9D
+         HEX AC0E9D60ADC2AAACC1AA604C51A8EAEA
+         HEX 4C59FA4C65FF4C58FF4C65FF4C65FF65
+         HEX FF20D19EAD51AAF01548AD5CAA912868
+         HEX 30034C26A620EA9DA424A9609128ADB3
+         HEX AAF0032082A6A9038D52AA20BA9F20BA
+         HEX 9E8D5CAA8E5AAA4CB39F6C380020D19E
+         HEX AD52AA0AAABD119D48BD109D48AD5CAA
+         HEX 608D5CAA8E5AAA8C5BAABAE8E88E59AA
+         HEX A203BD53AA9536CA10F860AEB7AAF003
+         HEX 4C789FAE51AAF008C9BFF075C533F027
+         HEX A2028E52AACDB2AAD019CA8E52AACA8E
+         HEX 5DAAAE5DAA9D0002E88E5DAAC98DD075
+         HEX 4CCD9FC98DD07DA2008E52AA4CA49FA2
+         HEX 008E52AAC98DF007ADB3AAF067D05E48
+         HEX 38ADB3AAD003205EA66890ECAE5AAA4C
+         HEX 159FC98DD005A9058D52AA200EA64C99
+         HEX 9FCDB2AAF085C98AF0F1A2048E52AAD0
+         HEX E1A9008D52AAF025A9008DB7AA2051A8
+         HEX 4CDCA4AD0002CDB2AAF00AA98D8D0002
+         HEX A2008E5AAAA940D006A910D002A9202D
+         HEX 5EAAF00F20BA9F20C59F8D5CAA8C5BAA
+         HEX 8E5AAA2051A8AE59AA9AAD5CAAAC5BAA
+         HEX AE5AAA38606C3600A98D4CC59FA0FF8C
+         HEX 5FAAC88C62AAEE5FAAA20008BD0002CD
+         HEX B2AAD001E88E5DAA20A4A1297F5984A8
+         HEX C80AF002680890F028F020B984A8D0D6
+
 ;=============================================================================
-; CLEAN LOADER ($1900)
-; Replaces cracker's relocation routine
-; Sets hi-res full-screen graphics mode and starts the game
-;=============================================================================
-
-         ORG  $1900
-
-INIT     LDA TXTCLR           ; Enable graphics mode
-         LDA MIXCLR           ; Full screen (no text window)
-         LDA HIRES            ; Enable hi-res mode
-         JMP GAME_START       ; Start the game
-
-         DS  46,$00       ; zeroed (was cracker relocation code)
-
-;=============================================================================
-; GAME STATE VARIABLES ($193A-$1FFC)
-; Zeroed at load time
-;=============================================================================
-
-         ORG  $193A
-         DS   1731,$00   ; 1731 bytes zeroed game state
-
-;=============================================================================
-; PRE-HGR DATA ($1FFD-$1FFF)
-; 3 alignment bytes before HGR page 1
-;=============================================================================
-
-         ORG  $1FFD
-
-PRE_HGR  HEX A8D0D6             ; alignment bytes
-
-;=============================================================================
-; HGR DISPLAY PAGES ($2000-$5FFF)
-; 16KB - used as display buffers at runtime
-; Page 1: $2000-$3FFF (background + sprites)
-; Page 2: $4000-$5FFF (background snapshot for XOR restore)
-; Content at load time is overwritten by game initialization.
-; Original disk image contained pre-shifted sprite data here,
-; but these pages are cleared and redrawn before gameplay begins.
-;=============================================================================
-
-         ORG  $2000
-HGR_PAGE1
-         DS   $2000,$00        ; 8KB HGR page 1 (cleared by game init)
-HGR_PAGE2
-         DS   $2000,$00        ; 8KB HGR page 2 (cleared by game init)
-
-;=============================================================================
-; PLAYER SPRITE DATA ($6000-$6EFF)
-; Pre-shifted HGR bitmaps for player animations.
-; Each animation has 7 pixel-shift variants x 48 bytes per frame.
-; Animations: walk-right, walk-left, climb, dig-left, dig-right, stand
-; Referenced via pointer table at $7A22-$7A35
+; MAIN GAME CODE AND DATA ($6000-$A7FF)
+;
+; This region is IDENTICAL between the original and cracked versions
+; (99.6% byte-for-byte match). It stays at $6000-$A7FF and is NOT
+; relocated. Contains:
+;   $6000-$6EFF: Player sprite data (pre-shifted HGR bitmaps)
+;   $6F00-$6FBF: Platform tile masks and patterns
+;   $6FC0-$6FFF: Additional tile patterns
+;   $7000-$7002: GAME_START (JMP GAME_INIT)
+;   $7003-$7062: Font & icon data
+;   $7063-$706A: HGR calc variables
+;   $706B-$A7FF: All game logic (104 named subroutines)
+;
+; All comments, labels, and section headers are preserved from the
+; cracked version disassembly analysis.
 ;=============================================================================
 
          ORG  $6000
