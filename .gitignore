@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Large emulation artifacts (reproducible via woztools)
+boot_trace.log
+decoded_sectors/
+emu_*.bin
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Claude Code project config
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store

@@ -1,0 +1,292 @@
+===============================================================================
+APPLE PANIC (1981) - SUBROUTINE ANALYSIS
+Main Game Code Section: $6000-$A7FF
+===============================================================================
+
+===============================================================================
+SUBROUTINE FUNCTIONAL DESCRIPTIONS
+===============================================================================
+
+SUB_706B: HGR address calculation - converts Y-row in $7063 to HGR screen address pair in $02/$03 and $04/$05 (page 1 and page 2)
+SUB_709C: HGR pixel position setup - calls SUB_706B then computes column byte offset ($7068) and bit position ($7067) from X coordinate in $7064
+SUB_70D0: Decimal digit split - splits accumulator value into tens ($7162) and ones ($7163) digits for score/number display
+SUB_70EA: Screen region save - saves an 8-row x 5-column block of HGR screen data to buffer at $0700 (used before overwriting for restore)
+SUB_7125: Screen region restore - restores an 8-row x 5-column block of HGR screen data from buffer at $0700 back to screen
+SUB_7165: Score digit rendering - master routine to display a number at screen position (X,Y), splits into digits, draws font glyphs, updates score, checks high score
+SUB_71B5: Font character draw - draws a single 8x8 font character (from $7003 table) at the current HGR position, advances column
+SUB_71E8: Sound effect (rising/falling tone) - plays a two-phase speaker tone: descending pitch then ascending pitch (score increment / life lost sound)
+SUB_720F: Sound effect (long buzz) - plays a sustained buzzing speaker tone using nested delay loops (extra life earned sound)
+SUB_722F: Lives display - draws the remaining lives count at the bottom-left of the HGR screen using font digits
+SUB_7264: Score display - draws the 6-digit current score ($70BB-$70C0) at the bottom of the screen
+SUB_72A0: Score add - adds the ones/tens digits from $7162/$7163 into the score buffer ($70BB-$70C0) with BCD carry propagation
+SUB_72DF: Bonus timer display - draws the 4-digit bonus countdown timer ($70C8-$70CB) at the bottom of the screen
+SUB_731C: Bonus timer tick - decrements the bonus countdown timer; subtracts bonus penalty value ($70C7) every 32 frames
+SUB_7387: High score display - draws the 6-digit high score ($70C1-$70C6) at the bottom-right of the screen
+SUB_73C3: Bonus-to-score transfer - adds remaining bonus timer value to the player's score at level completion, then redraws high score
+SUB_73FD: Status bar clear - clears an 8-row strip at the bottom of the HGR screen (status bar area at row $B8)
+SUB_7436: High score update check - compares current score to high score; if current > high, copies score to high score buffer and redraws
+SUB_7552: Background pattern select - selects one of 4 background tile patterns from $0C00 table based on lives count, copies 48 bytes to $7E6E area
+SUB_757C: Enemy state clear - zeros out the entire enemy state table ($8581, 110 bytes), clearing all active enemies
+SUB_758B: Level setup / enemy spawn - initializes enemy positions, movement tables, and ladder configurations based on current level number ($7464)
+SUB_763B: Extra life check - awards an extra life (increments $722E) when score tens digit ($70BD) exceeds 3, plays buzz sound
+SUB_768E: Lives display with sound - decrements lives, draws player icon, plays buzz sound, redraws lives counter, then increments lives back (visual effect)
+SUB_769F: Delay loop - burns CPU time with nested countdown loops (used for pause between lives)
+SUB_7A3C: HGR address calculation (alt) - same algorithm as SUB_706B but uses variables at $7A05/$7A0B/$7A0C instead of $7063/$7069/$706A (for sprite drawing)
+SUB_7A6D: Sprite position setup (alt) - same as SUB_709C but for the alternate HGR variable set at $7A05/$7A06, stores results in $7A09/$7A0A
+SUB_7A8C: Keyboard input handler - reads keyboard ($C000), matches against key table at $7A12 (IJKM/DUEX keys), returns direction code in Y register
+SUB_7AB4: Player movement controller - master player update: reads input, validates movement against platforms/ladders, handles falling, digging, stomping
+SUB_7BD5: Sprite data pointer (walk right) - loads sprite frame data pointer into $08/$09 based on player X position (even/odd frame for animation)
+SUB_7BED: Sprite data pointer (walk left) - loads sprite frame data pointer into $08/$09 for leftward walking animation
+SUB_7C05: Sprite data pointer (climb) - loads sprite frame data pointer into $08/$09 for climbing up/down animation
+SUB_7C1E: Sprite data pointer (dig left) - loads sprite frame data pointer for digging-left animation, with animation phase toggle ($7C65)
+SUB_7C35: Sprite data pointer (dig right) - loads sprite frame data pointer for digging-right animation, with animation phase toggle ($7C65)
+SUB_7C4C: Sprite data pointer (standing) - loads sprite frame data pointer for the player's idle/standing pose
+SUB_7C66: Player sprite draw - draws the player sprite at current position using XOR rendering with background restore from page 2
+SUB_7CDD: Platform/ladder collision check - tests if position (A=row, Y=column) intersects a platform or ladder in the level map ($7E6E table); returns 0=air, 1=top, 2=bottom, 3=on-ladder
+SUB_7D19: Sprite pointer dispatch - selects the correct sprite data pointer routine based on current action code ($7A10): walk R/L, climb, dig L/R, etc.
+SUB_7D60: Player sprite erase - erases the player sprite from the screen using XOR with the sprite data, restoring the background
+SUB_7DFD: Player frame update - erases old sprite, processes input/movement, redraws sprite at new position, ticks hourglass timer, adds delay
+SUB_7E09: Player move+redraw - erases sprite, calls movement controller (SUB_7AB4), stores new direction, redraws sprite at updated position
+SUB_7E1D: HGR page copy (page 1 to page 2) - copies all of HGR page 1 ($2000-$3FFF) to page 2 ($4000-$5FFF) as background backup
+SUB_7E40: Status bar border draw - draws the decorative border line (alternating $AA/$D5 pattern) at rows $B0-$B1 separating play area from status bar
+SUB_7EC4: Level platform/ladder renderer - iterates through the level map table ($7E6E) and draws all platforms and ladders on the HGR screen
+SUB_7F19: Platform segment draw (top half) - draws 1 row of a platform segment using mask+OR from tile data at $6F00/$6F40
+SUB_7F3E: Platform segment draw (bottom half) - draws 1 row of a platform segment using mask+OR from tile data at $6F00/$6F80
+SUB_7F63: Floor structure draw - draws the 5 floor levels of the playfield (at rows $10,$30,$50,$70,$90) by calling SUB_7F7F for each
+SUB_7F7F: Single floor draw - draws one complete floor: 2 rows of solid pattern ($2A/$54), then open rows with wall columns ($2A/$15/$55 pattern)
+SUB_7FD3: Game speed delay - adjustable delay loop using value in A; also produces walking sound effect by toggling speaker ($C030) during movement
+SUB_801A: Hole map lookup - searches the hole table ($7803/$7904) to find if a hole exists at given position (A=row, Y=column); returns hole depth
+SUB_80C3: Hole table clear - zeros out the entire hole position ($7803) and depth ($7904) tables (256 bytes each)
+SUB_80D3: Dig hole validation - checks if the player can dig a hole at the adjacent position: must be on a floor edge, target column must be clear
+SUB_817F: Stomp validation - checks if player can stomp/fill a hole: must be on a floor edge, target must have an existing hole underneath
+SUB_81A9: Move-onto-ladder validation - checks if the player can step onto a ladder when moving left/right; handles falling-through-hole detection
+SUB_8272: Dig hole animation controller - manages the multi-frame digging animation sequence: start dig, deepen hole, play sound, toggle sprite phase
+SUB_82C1: Find empty hole slot - scans hole table to find the nearest empty slot for a new hole at the current dig position
+SUB_82DA: Hole creation - places a new hole in the hole table at the dig target position, draws the initial hole sprite using SUB_8311
+SUB_8311: Hole sprite renderer - draws a hole tile at a specified position using sprite data with mask operations; handles animation frames for hole depth
+SUB_8393: Hourglass/timer bar draw - draws the 3-row bonus timer bar at screen row $B4 using alternating $AA/$D5 pattern with $7F mask at midpoint
+SUB_83C6: Hourglass/timer tick - decrements the visual timer bar by masking out one column every 32 frames; represents bonus countdown visually
+SUB_8402: Hole fill (stomp) - fills in a previously dug hole by decrementing hole depth, redrawing the hole sprite, and clearing it when depth reaches 0
+SUB_844E: Stomp animation controller - manages the multi-frame stomping/filling animation: similar to dig controller but reverses the hole
+SUB_848E: Sound effect (stomp/dig impact) - plays a short percussive speaker tone (5 iterations of max-delay toggle) for dig/stomp actions
+SUB_84A4: Enemy sprite erase (XOR) - erases an enemy sprite from the screen at its current position using XOR operation with sprite data from ($00),Y
+SUB_850F: Enemy sprite draw (masked) - draws an enemy sprite at its current position using mask ($1600,Y) and OR operations for proper background interaction
+SUB_860E: Enemy sprite update - swaps animation frames, erases old sprite, then calls SUB_8650 to draw at new position based on movement direction
+SUB_8650: Enemy draw with movement - draws the enemy sprite at its position, adjusting coordinates based on movement direction (0=still, 1=right, 2=left, 3=up, 4=down)
+SUB_8702: Collision detection (enemy vs entity) - computes bounding boxes for an enemy and another entity; returns 1 if overlapping, 0 if not
+SUB_87C6: Enemy AI tick - master per-enemy update: checks if fallen in hole (SUB_8B76), handles trapped state (SUB_8CA1), else moves in current direction with boundary checks
+SUB_87F5: Enemy stop/idle - sets enemy movement direction to 0 (stopped), redraws the enemy sprite in idle pose
+SUB_8854: Enemy-vs-enemy collision handler - checks current enemy against all other active enemies; if collision detected, stops the enemy
+SUB_8890: Enemy floor/ladder check - checks if the enemy is at a floor junction by testing platform collision at its feet position
+SUB_890B: Enemy AI decision - master AI direction chooser for one enemy: evaluates platform edges, ladders, player position; picks direction (1-4) using pseudo-random input
+SUB_8A18: Enemy at floor edge check - returns 1 if enemy's Y position is NOT aligned to a floor boundary (i.e., mid-traversal), 0 if on a floor edge
+SUB_8A2C: Pseudo-random byte - reads a byte from the ROM character generator table ($F800) using an incrementing index as a pseudo-random number source
+SUB_8A83: Enemy position init for drawing - copies enemy X/Y from state tables ($85A9/$85B3) into drawing parameter variables ($849E/$849F/$860C/$860D)
+SUB_8A9F: Collision detection (enemy vs player) - computes bounding boxes for enemy and player; if overlapping, jumps to player death at L_910F
+SUB_8B60: Hole lookup at position - searches hole table ($7803) for a hole at column A, row Y; returns hole depth value or 0 if none
+SUB_8B76: Enemy hole-fall check - checks if enemy is standing over a hole; if yes, marks enemy as trapped, sets fall depth, begins falling animation
+SUB_8C51: Enemy sprite erase (current) - erases the current enemy's sprite from screen by loading its state and calling SUB_84A4
+SUB_8C79: Enemy sprite draw (current) - draws the current enemy's sprite to screen by loading its state and calling SUB_850F
+SUB_8CA1: Enemy trapped state handler - manages enemy behavior while trapped in a hole: if deep enough, counts down; otherwise, enemy climbs out one row per tick
+SUB_8D20: Enemy reached floor check - checks if a falling enemy has reached a floor level (Y mod 32 == 0); returns 0 if landed, 1 if still falling
+SUB_8D35: Hole clear after enemy passes - finds and clears the hole table entry for the column where the enemy fell through
+SUB_8E00: Initial enemy draw - draws all active enemies at their starting positions and plays the spawn sound for each
+SUB_8E23: Enemy update (one per frame) - updates one enemy per call in round-robin: collision check, AI tick, movement; cycles through enemy index $85F9
+SUB_8E4B: Enemy AI+movement dispatch - calls SUB_890B for AI if enemy is active, otherwise calls SUB_8E5C (spawn check)
+SUB_8E5C: Null subroutine - immediate RTS, placeholder (enemy spawn slot currently unused)
+SUB_8F6E: Enemy crush check (during fall) - while enemy is falling, checks if it collides with another enemy below; if so, kills that enemy and awards points
+SUB_8FE2: Enemy death handler - handles enemy reaching bottom of hole: if bonus kill conditions met, launches enemy away; otherwise, removes enemy and awards score
+SUB_9023: Enemy score award - tallies bonus multiplier from all killed enemies this cycle, then calls SUB_7165 to display the score at the kill position
+SUB_904D: Bonus kill check - checks if conditions are met for a bonus score multiplier (based on enemy type and kill count this frame)
+SUB_906E: Score multiplier accumulate - adds current kill bonuses from $9091 table into $9097 accumulator for chain-kill scoring
+SUB_908A: Post-kill cleanup - clears the hole at the kill position (SUB_8D35) and increments the kill counter ($904C)
+SUB_912B: Enemy spawn sound - plays a two-tone beep (speaker toggle + delays) as sound effect when an enemy appears
+SUB_9138: Short delay - delay loop counting X from 0 to $F8 (used as part of spawn sound timing)
+SUB_9140: Medium delay - nested delay loop (X*Y iterations from 0), ~65536 cycles of waiting
+SUB_914B: Long delay - nested delay loop starting from $F3, slightly shorter than SUB_9140 (used for timing between enemy updates when slot is empty)
+SUB_9156: Enemy respawn animation - plays a 4-phase animation with alternating sound effects (SUB_919E/SUB_91BE) when an enemy respawns after being killed
+SUB_9193: Animation frame delay - delay loop (~$60 * 256 cycles) between animation frames during respawn sequence
+SUB_919E: Sound effect (respawn tone A) - plays 96 cycles of a two-frequency alternating tone (speaker toggle at X=$20 and X=$16 delays)
+SUB_91BE: Sound effect (respawn tone B) - plays 96 cycles of a two-frequency alternating tone (speaker toggle at X=$20 and X=$05 delays), higher pitched variant
+SUB_91DE: Tiny delay - simple countdown loop, DEX until zero; used as sub-delay within sound effect routines
+SUB_A040: Applesoft BASIC variable lookup stub - appears to be remnant/overlay of Applesoft ROM routine at $A040 (not part of game logic)
+
+===============================================================================
+KEY GAME STRUCTURES
+===============================================================================
+
+MAIN GAME LOOP:
+  Location: L_74E9 ($74E9) -> jumps to $0400 (code in text page buffer)
+  The $0400 area contains machine code (not text screen data) that forms
+  the main game loop. It dispatches to:
+    - SUB_8E23 (enemy update, called multiple times per frame based on
+      enemy count from hourglass value $8391)
+    - SUB_7E09 / SUB_7DFD (player update, input, movement, drawing)
+    - SUB_7F63 via indirect calls (floor redraw)
+    - L_7656 (player death) when $8391 reaches 0
+  After processing, jumps back to L_74E9 to repeat.
+
+  The number of enemy updates per frame scales with the timer:
+    $8391 >= $1E: 4x SUB_8E23 calls
+    $8391 >= $14: 3x SUB_8E23 calls
+    $8391 >= $0A: 2x SUB_8E23 calls
+    $8391 >= $01: 1x SUB_8E23 call
+    $8391 == $00: player death (JMP L_7656)
+
+PLAYER MOVEMENT ROUTINES:
+  SUB_7AB4: Master player controller (input -> validation -> position update)
+  SUB_7A8C: Keyboard input reading (IJKM keys for directions, D/U for dig, X/E for stomp)
+  SUB_7E09: Player move + redraw cycle
+  SUB_7DFD: Full player frame update (erase, move, redraw, sound, delay)
+  L_7AC4 - L_7BCD: Direction-specific handlers within SUB_7AB4:
+    Y=1: Move right (check platform, adjust $7A0E)
+    Y=2: Move left (check platform, adjust $7A0E)
+    Y=3: Move up (check ladder at $7A0D, climb via SUB_7CDD)
+    Y=4: Move down (check ladder, descend)
+    Y=6/7: Dig hole left/right (calls SUB_80D3, SUB_8272)
+    Y=8/9: Stomp/fill left/right (calls SUB_817F, SUB_844E)
+  L_8044: Falling handler - player falls when not on platform/ladder
+
+ENEMY AI ROUTINES:
+  SUB_890B: Master enemy AI - decides direction for each enemy each tick
+  SUB_87C6: Per-enemy update dispatcher (move, animate, collision check)
+  SUB_8854: Enemy-vs-enemy collision resolution
+  SUB_8702: Bounding box collision test
+  SUB_8A9F: Enemy-vs-player collision (triggers player death)
+  SUB_8890: Enemy platform/ladder awareness
+  SUB_8A18: Floor alignment check for AI decisions
+  SUB_8A2C: Pseudo-random direction selection (reads from ROM $F800)
+
+DRAWING/RENDERING ROUTINES:
+  SUB_7E9E: Clear HGR screen ($2000-$5FFF) and set graphics mode ($C050/$C057/$C054/$C052)
+  SUB_7E1D: Copy HGR page 1 to page 2 (background snapshot for XOR sprite rendering)
+  SUB_7F63: Draw all 5 floor levels
+  SUB_7F7F: Draw a single floor structure (solid top + open interior with walls)
+  SUB_7EC4: Draw all platforms and ladders from level map
+  SUB_7F19: Draw platform tile (top half, using $6F00/$6F40 tile data)
+  SUB_7F3E: Draw platform tile (bottom half, using $6F00/$6F80 tile data)
+  SUB_7E40: Draw status bar separator line at rows $B0-$B1
+  SUB_7C66: Draw player sprite (XOR with background restore)
+  SUB_7D60: Erase player sprite (XOR removal)
+  SUB_7D19: Select sprite frame data pointer based on action
+  SUB_860E: Update enemy sprite (erase old + draw new)
+  SUB_8650: Draw enemy sprite with directional offset
+  SUB_84A4: Erase enemy sprite (XOR)
+  SUB_850F: Draw enemy sprite (mask+OR compositing)
+  SUB_8311: Draw hole tile with depth-based frame selection
+  SUB_7165: Draw a number (score) at a screen position
+  SUB_71B5: Draw a single font character glyph
+  SUB_8393: Draw the hourglass/timer bar
+  SUB_83C6: Animate (shrink) the timer bar
+  SUB_73FD: Clear the status bar area
+
+SOUND EFFECT ROUTINES:
+  SUB_71E8: Score/life sound (rising-falling sweep via $C030)
+  SUB_720F: Extra life buzz (sustained tone via $C030)
+  SUB_848E: Dig/stomp impact sound (short percussive hit)
+  SUB_912B: Enemy spawn beep (two-tone)
+  SUB_919E: Respawn tone A (alternating frequency)
+  SUB_91BE: Respawn tone B (higher-pitched alternating frequency)
+  SUB_7FD3: Walking sound (movement-paced speaker clicks during delay)
+  All sound is produced by toggling the speaker at $C030.
+
+SCORE DISPLAY ROUTINES:
+  SUB_7264: Draw current score (6 digits from $70BB-$70C0)
+  SUB_72A0: Add to score (BCD addition with carry propagation)
+  SUB_72DF: Draw bonus timer digits ($70C8-$70CB)
+  SUB_7387: Draw high score (6 digits from $70C1-$70C6)
+  SUB_7436: Update high score if current score exceeds it
+  SUB_73C3: Transfer remaining bonus to score at level end
+  SUB_722F: Draw remaining lives count
+  SUB_70D0: Split number into tens/ones for display
+
+INPUT HANDLING ROUTINES:
+  SUB_7A8C: Read keyboard at $C000, match against key table at $7A12
+           Key mapping: I=up, J=left, K=right, M=down, D/U=dig, X/E=stomp
+           Returns direction code in Y (0=none, 1-4=movement, 5-9=actions)
+  L_7684: Game over screen - waits for 'S' key ($D3) to restart
+  L_74E9: Main loop clears keyboard strobe at $C010
+
+LEVEL MANAGEMENT ROUTINES:
+  GAME_INIT ($7471): Master initialization - zeros score, sets 3 lives, level 1, jumps to L_9300
+  L_9300: Level number clamp - caps level index at 7, jumps to L_74A2
+  L_74A2: Level load - sets bonus timer, calls screen setup, platform draw, enemy spawn
+  SUB_758B: Enemy/ladder configuration per level - reads level data tables ($7780, $7617, $0E00)
+           to set enemy count, positions, and ladder patterns based on level number
+  SUB_7552: Background pattern selection - picks visual theme based on lives/level
+  L_762E: Level complete handler - transfers bonus to score, increments level, jumps to L_930D
+  L_930D: Level transition - checks if all enemies are dead; if so, awards bonus and loads next level
+  L_7656: Player death handler - plays death sound x5, updates high score, decrements lives;
+          if lives remain, respawns at L_7485; if game over, waits for 'S' key at L_7684
+  L_9332: Game complete (level 49 reached) - switches to text mode, displays victory message
+
+===============================================================================
+KEY ZERO-PAGE AND MEMORY VARIABLE MAP
+===============================================================================
+
+$00-$01: Sprite data pointer (low/high) for enemy rendering
+$02-$03: HGR screen address (page 1) - computed by SUB_706B/SUB_7A3C
+$04-$05: HGR screen address (page 2) - computed by SUB_706B/SUB_7A3C
+$06-$07: Sprite data offset accumulator
+$08-$09: Sprite frame data pointer (set by SUB_7BD5/7BED/7C05 etc.)
+$E0: Delay parameter storage (SUB_7FD3)
+$E1: Walking sound phase toggle (even/odd frame for speaker click)
+
+$70BB-$70C0: Current score (6 BCD digits)
+$70BD-$70BE: Score add accumulators
+$70C1-$70C6: High score (6 BCD digits)
+$70C7: Bonus penalty rate
+$70C8-$70CB: Bonus timer digits (4 BCD digits)
+$70CC-$70CD: Temp position storage for display routines
+$722E: Lives remaining
+$722B-$722C: Temp counters for display loops
+$7464: Current level number (1-49)
+
+$7A05: Current sprite/calc Y row
+$7A06: Current sprite/calc X column
+$7A09: Computed HGR bit position
+$7A0A: Computed HGR byte column offset
+$7A0B-$7A0C: HGR page base constants (like $7069/$706A)
+$7A0D: Player Y position (row)
+$7A0E: Player X position (column)
+$7A0F: Last movement direction (0=none)
+$7A10: Current player action/direction code
+$7A12-$7A1A: Key code lookup table
+$7A1B: Right boundary limit
+$7A1C: Left boundary limit
+
+$7803-$78FF: Hole X-position table (up to 15 holes per floor)
+$7904-$79FF: Hole depth/state table (parallel to $7803)
+$7E6E-$7E9D: Level map - platform/ladder column positions
+$7E7E-$7E8D: Level map - platform top row positions
+$7E8E-$7E9D: Level map - platform bottom row positions
+
+$803B: Player-on-ground flag (0=falling, $FF=grounded)
+$803C: Player-movement-active flag
+$803D: Saved direction for fall recovery
+$8270: Current dig/stomp target hole slot index
+$826C-$826D: Temp position for collision/validation checks
+$826F: Dig/stomp animation frame counter
+
+$8391: Hourglass/timer value (decrements; controls enemy speed & triggers death at 0)
+$8392: Timer tick sub-counter (counts to $20 per timer decrement)
+
+$8581-$858A: Enemy active flags (10 enemy slots, 0=inactive, nonzero=active)
+$858B-$8594: Enemy sprite data pointer low bytes
+$8595-$859E: Enemy sprite data pointer high bytes
+$859F-$85A8: Enemy type/score value
+$85A9-$85B2: Enemy X positions (10 slots)
+$85B3-$85BC: Enemy Y positions (10 slots)
+$85BD-$85C6: Enemy movement direction (0=stop,1=right,2=left,3=up,4=down)
+$85C7-$85D0: Enemy trapped-in-hole flag
+$85D1-$85DA: Enemy current animation frame
+$85DB-$85E4: Enemy alternate animation frame
+$85E5-$85EE: Enemy fall depth counter
+$85EF-$85F8: Enemy trapped-hole reference index
+$85F9: Current enemy index being processed
+$85FA-$85FF: Collision detection bounding box temp variables
+
+$904C: Kill counter for current cycle
+$9091-$9096: Kill bonus source values
+$9097-$909C: Kill bonus accumulated values
+===============================================================================
