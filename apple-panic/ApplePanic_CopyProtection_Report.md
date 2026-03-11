@@ -341,43 +341,7 @@ trust their physical order on disk. This is the strongest anti-copy measure:
 
 ---
 
-## 7. Comparison: Protected vs Cracked Versions
-
-### 7.1 Known Cracked Version
-
-The cracked version (`ApplePanic_runtime.bin`, 43,008 bytes) is a clean memory
-image loadable at `$0000-$A7FF` with:
-
-- Game code at `$7000-$A800` (entry point `JMP $7465`)
-- Sprite data at `$0800-$1FFF` and `$6000-$6FFF`
-- HGR page buffers at `$2000-$5FFF` (zeroed at runtime)
-
-### 7.2 Data Size Comparison
-
-- Protected disk: ~46,592 bytes of sector data (182 sectors x 256 bytes,
-  excluding duplicate/sentinel sectors)
-- Cracked binary: 43,008 bytes
-
-The ~3.5KB difference accounts for the boot loader code, disk I/O routines,
-decryption code, and sector interleave tables that are present on the original
-disk but unnecessary in the cracked version.
-
-### 7.3 What Crackers Had to Do
-
-To produce the cracked version, the crackers would have needed to:
-
-1. **Boot-trace** the original disk using a modified monitor to capture the
-   decryption routine as it executes
-2. **Identify the decryption key(s)** and memory load addresses for each
-   track/sector
-3. **Capture the fully decrypted game** from memory after the loader completes
-4. **Create a standard DOS 3.3 loader** (BRUN) to replace the custom boot chain
-5. **Remove or neutralize** any runtime copy-protection checks (disk access
-   during gameplay, nibble count checks, etc.)
-
----
-
-## 8. Protection Effectiveness Assessment
+## 7. Protection Effectiveness Assessment
 
 > **Updated:** Full emulation revealed **nine distinct layers**, correcting the
 > earlier five-layer analysis. What appeared to be "encryption" is actually GCR
@@ -404,13 +368,13 @@ checksum invariants, per-track marker variations, and non-standard sector
 numbering would have defeated virtually all automated copy programs of the era
 (Locksmith, Copy II Plus, EDD).
 
-The protection was ultimately defeated -- cracked versions exist -- but it
-required skilled crackers with boot-tracing capability to capture the decrypted
-game from memory rather than from disk.
+Defeating this protection requires boot-tracing capability — running the
+original code and capturing the fully decoded game from memory, since the
+data on disk cannot be decoded without the custom boot chain.
 
 ---
 
-## 9. Tools and Methodology
+## 8. Tools and Methodology
 
 This analysis was performed using custom Python scripts that:
 
@@ -418,9 +382,8 @@ This analysis was performed using custom Python scripts that:
 2. **Convert bits to nibbles** using standard Apple II nibble framing
 3. **Search for prologue patterns** (`D5 AA 96`, `D5 xx B5`, `D5 AA AD`)
 4. **Decode 4-and-4 address fields** to extract volume/track/sector/checksum
-5. **Decode 6-and-2 data fields** to extract 256-byte sector data
-6. **Attempt decryption** using single-byte XOR, multi-byte XOR, and
-   sector-level pattern matching against the known cracked version
+5. **Decode 5-and-3 / 6-and-2 data fields** to extract sector data
+6. **Emulate the full boot process** using a 6502 CPU emulator with Disk II soft switch simulation
 
 Scripts used: `woz_reader.py`, `woz_analyze.py`, `woz_decode.py`,
 `woz_deep.py`, `woz_sectors.py`, `woz_boot.py`, `woz_compare.py`

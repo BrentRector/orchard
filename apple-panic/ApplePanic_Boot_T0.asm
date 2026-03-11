@@ -1,6 +1,10 @@
 ; ============================================================================
-; Apple Panic — Track 0 Copy Protection Code
+; Apple Panic — Track 0 Boot Code and Copy Protection
 ; Disassembled from WOZ disk image (Apple Panic - Disk 1, Side A.woz)
+;
+; This file covers track 0: the boot sector, custom RWTS, and the stage 2
+; loader that reads tracks 1-5 and establishes the secondary loader at $B700.
+; The game code loaded by tracks 6-13 is in ApplePanic.asm.
 ;
 ; BOOT PROCESS:
 ; 1. Standard Disk II boot ROM ($C600) finds D5 AA 96 T0 S0, decodes 6-and-2,
@@ -25,7 +29,7 @@
 ;   S9  $1100  Address field writer (nibble output)
 ;   S10 $1200  Data table (GCR translate / sector data)
 ;   S11 -----  NOT PRESENT (physical sector is the 6-and-2 anti-copy trap)
-;   S12 $1400  I/O handler (EXACT match with cracked version $1F00)
+;   S12 $1400  Character I/O handler
 ; ============================================================================
 
 
@@ -278,7 +282,7 @@ rwts_find_addr:
 ; ============================================================================
 ; SECTOR 5 ($0D00) — Data Table
 ; Small values (0-31). Likely GCR decode table or sector interleave map.
-; 42% match with cracked $1A00. Checksum: OK
+; Checksum: OK
 ; ============================================================================
             .ORG $0D00
 
@@ -289,7 +293,7 @@ rwts_find_addr:
 
 ; ============================================================================
 ; SECTOR 6 ($0E00) — Data Table
-; Mostly zeros with a few values. 38% match with cracked $0E00.
+; Mostly zeros with a few values.
 ; Checksum: OK
 ; ============================================================================
             .ORG $0E00
@@ -375,8 +379,7 @@ write_addr_field:
 
 ; ============================================================================
 ; SECTOR 12 ($1400) — Character I/O Handler
-; EXACT MATCH with cracked version at $1F00.
-; Part of the game's monitor/command processor.
+; Part of the game's character input/command processor.
 ; Checksum: OK
 ; ============================================================================
             .ORG $1400

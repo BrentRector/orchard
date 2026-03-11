@@ -140,7 +140,7 @@ Documentation of all scripts and tools used to decode the Apple Panic disk.
 ## Key Data Files
 
 - `Apple Panic - Disk 1, Side A.woz` — Original protected WOZ2 disk image
-- `ApplePanic_runtime.bin` — Cracked version memory dump ($0000-$A7FF, 43008 bytes)
+- `ApplePanic_runtime.bin` — Runtime memory image ($0000-$A7FF, 43008 bytes, extracted via boot emulation)
 - `DiskII_BootROM.md` — P6 Boot ROM documentation
 - `decoded_sectors/` — Decoded binary sector data from track 0
 

@@ -8,6 +8,57 @@
 ; Load: Tracks 6-13 loaded to $4000-$A7FF by secondary loader at $B700
 ; Entry: $4000 (relocation routine, then JMP GAME_START at $7000)
 ;
+; Disk layout (14 tracks, 5-and-3 GCR / 13 sectors per track):
+;
+;   Track 0 — Boot track (DUAL FORMAT: one 6-and-2 sector + thirteen 5-and-3)
+;     6-and-2 S0:  Anti-copy trap ($0800) — crashes if booted by standard ROM
+;     5-and-3 S0:  Configuration data ($0800)
+;     5-and-3 S1:  Data (bad checksum — encrypted or decoy)
+;     5-and-3 S2:  5-and-3 byte reconstruction routine ($0A00)
+;     5-and-3 S3:  Custom RWTS — reads D5 AA B5 addr / D5 AA AD data ($0B00)
+;     5-and-3 S4:  Byte reconstruction completion ($0C00)
+;     5-and-3 S5:  GCR translate / sector skew table ($0D00)
+;     5-and-3 S6:  Data table ($0E00)
+;     5-and-3 S7:  Disk command handler entry ($0F00)
+;     5-and-3 S8:  Seek / track compare ($1000)
+;     5-and-3 S9:  Address field writer ($1100)
+;     5-and-3 S10: GCR data table ($1200)
+;     5-and-3 S11: NOT PRESENT (physical sector is the 6-and-2 anti-copy trap)
+;     5-and-3 S12: Character I/O handler ($1400)
+;     Stage 2 loader at $0301 corrupts GCR table, loads S0-S9 to $B600-$BFFF
+;     See ApplePanic_Boot_T0.asm for full boot sector and RWTS disassembly
+;
+;   Tracks 1-5 — Intermediate loader + title screen (65 sectors -> $0800-$48FF)
+;     Address markers: $DE $AA $xx (third byte varies per track)
+;     Contains: title screen HGR bitmap, display/sound routines,
+;     RWTS patcher (replaces $D5 with $DE for tracks 1+),
+;     per-track third-byte lookup table
+;
+;   Tracks 6-13 — Game payload (104 sectors -> $4000-$A7FF)  [THIS FILE]
+;     Address markers: $DE $AA $xx (per-track third byte from table)
+;     $4000-$4024: Relocation routine (copies data to lower memory)
+;     $4025-$402A: Game startup bridge -> JMP $7000
+;     $402B-$43FF: Game subroutines (sprite animation, player helpers)
+;     $4400-$5FFF: Data relocated to $0400-$1FFF (sprites, tiles, tables)
+;     $6000-$A7FF: Main game code + data (stays in place)
+;
+;   Tracks 14-34 — Empty (unused)
+;
+;   Per-track address prolog third byte table:
+;     Track:  0   1   2   3   4   5   6   7   8   9  10  11  12  13
+;     Value: AA  BE  BE  AB  BF  EB  FB  AA  FA  AA  AB  EA  EF  BB
+;
+; Copy protection (9 layers — see CopyProtection.md):
+;   1. Dual-format track 0 (6-and-2 boot sector + 5-and-3 data sectors)
+;   2. Invalid address field checksums on all 13 track-0 sectors
+;   3. GCR table corruption (ASL×3 on upper entries at $0899-$08FF)
+;   4. Intentionally bad checksum on sector 11 (decoy sector)
+;   5. Custom post-decode permutation ($0346 vs standard $02D1)
+;   6. Self-modifying code in boot chain ($031B patches $0320)
+;   7. $DE address markers on tracks 1+ (instead of standard $D5)
+;   8. Per-track third-byte variations in address prologs
+;   9. Non-standard sector/track numbers in address fields
+;
 ; Memory layout after relocation:
 ;   $0400-$04FF  Game loop dispatcher (from $4400)
 ;   $0500-$07FF  Text page blanks / screen holes (from $4500)
@@ -64,8 +115,8 @@ KEY_STP2 EQU  $C5             ; 'E' key - stomp/fill (alt)
 ; RELOCATION ROUTINE ($4000-$4024)
 ;
 ; Entry point from secondary loader at $B700.
-; This code is unique to the original copy-protected disk and does not
-; exist in the cracked version, which loads the game pre-relocated.
+; This code is unique to the original copy-protected disk — it does not
+; appear in pre-relocated memory dumps of the game.
 ;
 ; Performs two copy operations:
 ;   Phase 1: $4400-$44FF -> $0400-$04FF (game loop dispatcher code)
@@ -132,7 +183,6 @@ GAME_JMP
 ;
 ; These routines are called by the main game code at $6000-$A7FF.
 ; They remain at their load addresses (not relocated).
-; Identical between original and cracked versions.
 ;
 ; Key routines in this region:
 ;
@@ -939,9 +989,8 @@ GAME_JMP
 ;=============================================================================
 ; MAIN GAME CODE AND DATA ($6000-$A7FF)
 ;
-; This region is IDENTICAL between the original and cracked versions
-; (99.6% byte-for-byte match). It stays at $6000-$A7FF and is NOT
-; relocated. Contains:
+; This region stays at $6000-$A7FF and is NOT relocated.
+; Contains:
 ;   $6000-$6EFF: Player sprite data (pre-shifted HGR bitmaps)
 ;   $6F00-$6FBF: Platform tile masks and patterns
 ;   $6FC0-$6FFF: Additional tile patterns
@@ -950,8 +999,8 @@ GAME_JMP
 ;   $7063-$706A: HGR calc variables
 ;   $706B-$A7FF: All game logic (104 named subroutines)
 ;
-; All comments, labels, and section headers are preserved from the
-; cracked version disassembly analysis.
+; All comments, labels, and section headers derived from recursive
+; descent disassembly of the original disk boot memory.
 ;=============================================================================
 
          ORG  $6000

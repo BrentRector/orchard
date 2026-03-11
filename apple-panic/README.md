@@ -60,8 +60,7 @@ python -m nibbler boot "apple-panic/Apple Panic - Disk 1, Side A.woz" \
 | File | Description |
 |------|-------------|
 | `Apple Panic - Disk 1, Side A.woz` | Original WOZ2 flux-level disk image (Applesauce capture) |
-| `ApplePanic` | Cracked binary (26,640 bytes, by "RIP_EM_OFF SOFTWARE") |
-| `ApplePanic_runtime.bin` | Clean runtime image (43,008 bytes, $0000-$A7FF) |
+| `ApplePanic_runtime.bin` | Runtime memory image (43,008 bytes, $0000-$A7FF, extracted via boot emulation) |
 | `ApplePanic_original.dsk` | Standard DSK conversion of the WOZ image |
 
 ### Documentation

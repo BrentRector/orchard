@@ -10,7 +10,7 @@ I started poking at it. How does this disk boot? What format are the sectors in?
 
 One thing led to another. I built a WOZ parser, then a GCR decoder, then a full 6502 CPU emulator, then a boot tracer. I hit dead ends — spent hours debugging a checksum failure that turned out to be in my own tooling, not the disk. I discovered nine distinct layers of copy protection, each one defeating a different class of copy tool. I traced 69.8 million emulated CPU instructions from power-on to game start.
 
-Cracked versions of Apple Panic exist — they've been around for decades — but that was never the point. I wanted to understand *why* the disk couldn't be copied, not just play the game. This repo is the result.
+I wanted to understand *why* the disk couldn't be copied, not just play the game. This repo is the result.
 
 ## Games
 

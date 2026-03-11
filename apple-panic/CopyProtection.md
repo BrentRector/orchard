@@ -148,7 +148,7 @@ Tracks 1-5 (65 sectors) -> $0800-$48FF:
 Tracks 6-13 (104 sectors) -> $4000-$A7FF:
   $4000: Game entry point (JMP $4000)
   $4000-$5FFF: Game initialization + screen setup
-  $6000-$A7FF: Main game code + data (matches cracked version 99.6%)
+  $6000-$A7FF: Main game code + data
 ```
 
 ---
