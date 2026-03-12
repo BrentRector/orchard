@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Script output directory
+apple-panic/output/
+
+# Large emulation artifacts (reproducible via nibbler)
+boot_trace.log
+decoded_sectors/
+emu_*.bin
+**/game_*.bin
+**/lowmem_*.bin
+**/rwts_*.bin
+**/title_*.bin
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Claude Code project config
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store

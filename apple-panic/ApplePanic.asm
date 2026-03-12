@@ -1,0 +1,8870 @@
+;=============================================================================
+; APPLE PANIC (1981) - Ben Serki / Broderbund Software
+; Disassembled from original copy-protected disk
+; (dual-format track 0: 6-and-2 boot + 5-and-3 GCR encoding)
+;
+; Assembler: Merlin32 syntax
+; Target: Apple ][+ with 48K RAM
+; Load: Tracks 6-13 loaded to $4000-$A7FF by game loader at $B700
+; Entry: $4000 (relocation routine, then JMP GAME_START at $7000)
+;
+; Disk layout (14 tracks, 5-and-3 GCR / 13 sectors per track):
+;
+;   Track 0 — Boot track (DUAL FORMAT: one 6-and-2 sector + thirteen 5-and-3)
+;     6-and-2 S0:  Boot sector ($0800) — loaded by P6 ROM, relocates to $0200
+;     5-and-3 S0-S9: Loaded by stage 2 to $B600-$BFFF (game loader + RWTS)
+;     5-and-3 S1:  Game loader entry ($B700, checksum OK with bit-doubling)
+;     5-and-3 S10-S12: Not used by boot loader (S11 has intentionally bad checksum)
+;     Stage 2 loader at $0301 corrupts GCR table, loads S0-S9 to $B600-$BFFF
+;     See ApplePanic_Boot_Stage2.asm for boot RWTS and stage 2 code
+;     See ApplePanic_GameLoader.asm for game loader and RWTS at $B700+
+;
+;   Tracks 1-5 — Intermediate loader + title screen (65 sectors -> $0800-$48FF)
+;     Address markers: $D5 $xx $B5 (second byte varies per track, first byte unpatched)
+;     Contains: title screen HGR bitmap, display/sound routines,
+;     RWTS patcher (replaces $D5 with $DE for tracks 6-13),
+;     per-track second-byte lookup table at $0400
+;
+;   Tracks 6-13 — Game payload (104 sectors -> $4000-$A7FF)  [THIS FILE]
+;     Address markers: $DE $xx $B5 (first byte patched, second varies per track)
+;     $4000-$4024: Relocation routine (copies data to lower memory)
+;     $4025-$402A: Game startup bridge -> JMP $7000
+;     $402B-$43FF: Game subroutines (sprite animation, player helpers)
+;     $4400-$5FFF: Data relocated to $0400-$1FFF (sprites, tiles, tables)
+;     $6000-$A7FF: Main game code + data (stays in place)
+;
+;   Tracks 14-34 — Empty (unused)
+;
+;   Per-track address prolog second byte table (Value = Raw | $AA):
+;     Track:  0   1   2   3   4   5   6   7   8   9  10  11  12  13
+;     Raw:   00  14  14  21  35  61  73  20  50  82  23  60  67  91
+;     Value: AA  BE  BE  AB  BF  EB  FB  AA  FA  AA  AB  EA  EF  BB
+;
+; Copy protection (9 layers — see CopyProtection.md):
+;   1. Dual-format track 0 (6-and-2 boot sector + 5-and-3 data sectors)
+;   2. Invalid address field checksums on all 13 track-0 sectors
+;   3. GCR table corruption (ASL×3 on upper entries at $0899-$08FF)
+;   4. Intentionally bad checksum on sector 11 (decoy sector)
+;   5. Custom post-decode permutation ($0346 vs standard $02D1)
+;   6. Self-modifying code in boot chain ($0237 patches $031F/$0320)
+;   7. Per-track second-byte variations in address prologs (all tracks 1-13)
+;   8. $DE address markers on tracks 6-13 (first byte patched from $D5)
+;   9. Non-standard sector/track numbers in address fields
+;
+; Memory layout after relocation:
+;   $0400-$04FF  Game loop dispatcher (from $4400)
+;   $0500-$07FF  Text page blanks / screen holes (from $4500)
+;   $0800-$097F  Platform tile bitmaps (from $4800)
+;   $0980-$09FF  Loader artifact + padding (from $4980)
+;   $0A00-$0BFF  Character sprite frames (from $4A00)
+;   $0C00-$0D7C  Background theme tiles (from $4C00)
+;   $0D7D-$0FFF  Runtime scratch / enemy spawn tables (from $4D7D)
+;   $1000-$15FF  Enemy sprite data (from $5000)
+;   $1600-$16FF  Sprite transparency masks (from $5600)
+;   $1700-$17FF  Solid fill pattern (from $5700)
+;   $1800-$18FF  Identity table (from $5800)
+;   $1900-$1FFF  Game state variables (from $5900)
+;   $4000-$43FF  Relocation routine + game subroutines (stays in place)
+;   $4400-$44FF  Identity table (overwritten during relocation)
+;   $6000-$A7FF  Main game code and data (stays in place)
+;
+; Build verification:
+;   Image size: $6800 (26624) bytes from $4000-$A7FF
+;   Game code MD5 ($6000-$A7FF): ffcd8c18f189fdd28894d51b03525083
+;=============================================================================
+
+;=============================================================================
+; HARDWARE EQUATES
+;=============================================================================
+
+KBD      EQU  $C000           ; Keyboard data (bit 7 = key ready)
+KBDSTRB  EQU  $C010           ; Keyboard strobe (clear bit 7)
+SPKR     EQU  $C030           ; Speaker toggle
+TXTCLR   EQU  $C050           ; Graphics mode (clear text)
+TXTSET   EQU  $C051           ; Text mode
+MIXCLR   EQU  $C052           ; Full screen (no text window)
+MIXSET   EQU  $C053           ; Mixed mode (4 lines text)
+TXTPAGE1 EQU  $C054           ; Display page 1
+TXTPAGE2 EQU  $C055           ; Display page 2
+LORES    EQU  $C056           ; Lo-res graphics
+HIRES    EQU  $C057           ; Hi-res graphics
+
+; --- Monitor ROM Entry Points ---
+COUT     EQU  $FDED           ; Character output
+HOME     EQU  $FC58           ; Clear screen
+
+; --- Key Codes (High ASCII) ---
+KEY_UP   EQU  $C9             ; 'I' key - move up
+KEY_LEFT EQU  $CA             ; 'J' key - move left
+KEY_RT   EQU  $CB             ; 'K' key - move right
+KEY_DOWN EQU  $CD             ; 'M' key - move down
+KEY_DIG1 EQU  $C4             ; 'D' key - dig hole
+KEY_DIG2 EQU  $D5             ; 'U' key - dig hole (alt)
+KEY_STP1 EQU  $D8             ; 'X' key - stomp/fill
+KEY_STP2 EQU  $C5             ; 'E' key - stomp/fill (alt)
+
+;=============================================================================
+; RELOCATION ROUTINE ($4000-$4024)
+;
+; Entry point from game loader at $B700.
+; This code is unique to the original copy-protected disk — it does not
+; appear in pre-relocated memory dumps of the game.
+;
+; Performs two copy operations:
+;   Phase 1: $4400-$44FF -> $0400-$04FF (game loop dispatcher code)
+;     Simultaneously builds an identity table at $4400:
+;     For each Y (0..255): reads $4400+Y, writes to $0400+Y,
+;     then stores Y itself back to $4400+Y.
+;     Result: $0400 has the game loop code, $4400 has table[n]=n.
+;
+;   Phase 2: $4800-$5FFF -> $0800-$1FFF (6144 bytes)
+;     Sprite data, tile data, identity table, display code.
+;     Uses self-modifying loop: INCs on source/dest high bytes
+;     to advance through 24 pages ($48-$5F -> $08-$1F).
+;
+; After relocation, falls through to $4025 which jumps to GAME_START.
+;=============================================================================
+
+         ORG  $4000
+
+RELOCATE
+         LDY #$00             ; Y = byte counter (0..255)
+;
+; Phase 1: Copy game loop code and build identity table
+;
+RELOC_LOOP1
+         LDA $4400,Y          ; Read game loop code byte
+         STA $0400,Y          ; Write to text page 1 ($0400)
+         TYA                  ; A = current index Y
+         STA $4400,Y          ; Overwrite source with identity: $4400[Y] = Y
+         INY                  ; Next byte
+         BNE RELOC_LOOP1      ; Loop 256 times
+;
+; Phase 2: Copy sprite/tile data ($4800-$5FFF -> $0800-$1FFF)
+; Self-modifying: INC advances page numbers each iteration
+;
+RELOC_LOOP2
+         LDA $4800,Y          ; Source page (self-modified: $48,$49,...,$5F)
+         STA $0800,Y          ; Dest page (self-modified: $08,$09,...,$1F)
+         INY
+         BNE RELOC_LOOP2      ; Copy 256 bytes per page
+         INC RELOC_LOOP2+2    ; Bump source high byte ($48->$49->...)
+         INC RELOC_LOOP2+5    ; Bump dest high byte ($08->$09->...)
+         LDA RELOC_LOOP2+5    ; Read current dest page
+         CMP #$20             ; Reached $20? (done: $1F was last page)
+         BNE RELOC_LOOP2      ; No -> copy next page
+;
+; Relocation complete. Fall through to game startup at $4025.
+;
+
+;=============================================================================
+; GAME STARTUP BRIDGE ($4025-$402A)
+;
+; The BNE at $4023 fails when the CMP #$20 matches (Z=1), so execution
+; falls through here. BEQ $4028 is always taken, jumping to JMP $7000.
+; The byte at $4027 ($2C = BIT abs) is dead code, never reached.
+;=============================================================================
+
+         BEQ GAME_JMP         ; Always taken: Z=1 from CMP #$20 match
+         DFB $2C              ; Dead byte: BIT opcode (never executed)
+GAME_JMP
+         JMP $7000            ; -> GAME_START -> JMP GAME_INIT ($7465)
+
+;=============================================================================
+; GAME SUBROUTINES ($402B-$43FF)
+;
+; These routines are called by the main game code at $6000-$A7FF.
+; They remain at their load addresses (not relocated).
+;
+; Key routines in this region:
+;
+;   PLR_ON_GROUND check ($402B-$4038):
+;     Tests PLR_ON_GROUND flag; if zero, jumps to fall handler.
+;     BIT $004C / BVS $40A8 pattern used for conditional branching.
+;
+;   Sprite frame calculation ($4039-$40E3):
+;     Computes sprite data pointers based on player position and
+;     animation state. Handles walk-right, walk-left, climb,
+;     dig-left, dig-right, and standing poses.
+;     Uses pointer tables at $7A22-$7A35 for pre-shifted frames.
+;
+;   DRAW_PLAYER ($40E4-$4163):
+;     Renders player sprite using OR compositing with HGR page 1.
+;     Calculates HGR address from Y-row, applies pixel shift offset,
+;     then draws 16 rows of 3-byte-wide sprite data.
+;
+;   ERASE_PLAYER ($4164-$41E8):
+;     Erases player sprite using XOR with page 2 background restore.
+;     Same structure as DRAW_PLAYER but uses EOR instead of ORA,
+;     then ORs with page 2 to restore background underneath.
+;
+;   UPDATE_PLAYER ($41E9-$4208):
+;     Full player frame update: calls all subsystems in sequence:
+;     JSR CLEAR_SCREEN, JSR DRAW_FLOORS, JSR DRAW_STATUS_BORDER,
+;     JSR DRAW_PLATFORMS, JSR COPY_HGR_PAGES, etc.
+;
+;   COPY_HGR_PAGES ($4209-$4228):
+;     Copies HGR page 1 ($2000-$3FFF) to page 2 ($4000-$5FFF)
+;     for background snapshot used by XOR sprite restore.
+;
+;   DRAW_STATUS_BORDER ($4224-$4244):
+;     Draws decorative $D5/$AA checkerboard border at rows $B0-$B1.
+;
+;   CLEAR_SCREEN ($429B-$42B8):
+;     Zeros both HGR pages ($2000-$5FFF), then sets graphics mode:
+;     LDA $C050 (graphics), LDA $C057 (hi-res),
+;     LDA $C054 (page 1), LDA $C052 (full screen).
+;
+;   DRAW_PLATFORMS ($42B9-$42DF):
+;     Iterates level map table at $7E6E, calling DRAW_PLAT_TOP and
+;     DRAW_PLAT_BOT for each platform/ladder segment.
+;
+;   DRAW_HOLE ($4311-$438C):
+;     Draws hole tile with depth-based animation frame.
+;     Uses pre-shifted tile data from $7A3A pointer.
+;
+;   DRAW_TIMER_BAR ($4393-$43C7):
+;     Draws 3-row hourglass timer bar at row $B4 using
+;     alternating $D5/$AA pattern with color inversion.
+;
+;   GAME_DELAY ($43D9-$43FF):
+;     CPU burn delay loop with optional walking sound clicks.
+;     Toggles speaker at $C030 based on walking phase.
+;=============================================================================
+
+         HEX 7CF006AC267AAE277A840886096018AC
+         HEX 247AAE257AAD657CF006AC287AAE297A
+         HEX 840886096018AC2E7AAE2F7AAD107A4A
+         HEX 9006AC347AAE357A8408860960000018
+         HEX 20197DAD0D7AAC0E7A8D057A8C067A20
+         HEX 6D7AA90085068507AE097A18F00FA506
+         HEX 69308506A90065078507CAD0EE18A506
+         HEX 65088508A5076509850918A9008D1F7A
+         HEX 18203C7AA000A502186D0A7A850218B1
+         HEX 02A20001089102A50869018508A50969
+         HEX 008509C8C003D0E6EE057AEE1F7AAD1F
+         HEX 7AC910D0CB60188D077A8C087AA0FF18
+         HEX C8B96E7EF029CD087AF0034CE67C18AD
+         HEX 077AD97E7EF01090E618AD077AD98E7E
+         HEX F009B0DBA9036018A9016018A90260A9
+         HEX 0060AD107AC901D00420D57B60C902D0
+         HEX 0420ED7B60C903D00420057C60C904D0
+         HEX 0420057C60C907D004201E7C60C906D0
+         HEX 0420357C60C909D004201E7C60C908D0
+         HEX 0420357C60204C7C601820197DAD0D7A
+         HEX AC0E7A8D057A8C067A206D7AA9008506
+         HEX 8507AE097AF01018A50669308506A900
+         HEX 65078507CAD0F018A50665088508A507
+         HEX 6509850918A9008D1F7A18203C7AA000
+         HEX A5026D0A7A8502A504186D0A7A850418
+         HEX B102A2004108AE3B80F00211049102A5
+         HEX 0869018508A50969008509C8C003D0DF
+         HEX EE057AEE1F7AAD1F7AC910D0BD60209E
+         HEX 7E20637F20407E20C47E201D7E209383
+         HEX 20C3804C388A20097E20C683A92020D3
+         HEX 7F601820607D20B47A98F0038D107A8D
+         HEX 0F7A20667C60A9208503A9408505A900
+         HEX 85028504A00018B1029104C8D0F8E603
+         HEX E605A503C940D0EE6018A9B08D057A20
+         HEX 3C7AA027A9D5910288A9AA91028810F4
+         HEX A9B18D057A203C7AA027A9D5910288A9
+         HEX AA91028810F460041424284058608204
+         HEX 000000000000000F4F0F4F0F2F0F4F8F
+         HEX 008F00000000006F6F2F8FAF8F2FAFAF
+         HEX 00AF000000000018A9208503A9008502
+         HEX A000189102C8D0FAE603A603E060D0F0
+         HEX AD50C0AD57C0AD54C0AD52C06018A000
+         HEX 8CDF7E18B96E7EF00C20E07EEEDF7EAC
+         HEX DF7E4CCA7E600400098D067AB97E7E38
+         HEX E90A188D057A206D7A18AD097A0A0A8D
+         HEX DD7E20197F20197F18203E7F203E7F20
+         HEX 197F20197F18ACDF7EB98E7ECD057AD0
+         HEX E76018EE057A203C7AA9038DDE7EAC0A
+         HEX 7AAEDD7E18BD006F31021D406F9102C8
+         HEX E8CEDE7ED0EE6018EE057A203C7AA903
+         HEX 8DDE7EAC0A7AAEDD7E18BD006F31021D
+         HEX 806F9102C8E8CEDE7ED0EE60A210207F
+         HEX 7FA230207F7FA250207F7FA270207F7F
+         HEX A290207F7F6096928A1869068D7D7F8A
+         HEX 1869028D7E7F8E057A203C7AA000A92A
+         HEX 189102C8A954189102C8C028D0F0E8EC
+         HEX 7E7FD0E2E88E057A203C7AA000A92A18
+         HEX 9102C8C027F009A915189102C84CB47F
+         HEX A955189102E8EC7D7FD0DA6085E0A8AA
+         HEX CAD0FD88D0FAAD3C80D00160A5E1D004
+         HEX E6E1D004A90085E118AD0F7A0A65E1A8
+         HEX 18B90880A0
+
+;=============================================================================
+; DATA BLOCK: RELOCATED TO $0400-$07FF ($4400-$47FF)
+;
+; During relocation, this 1024-byte block is copied to $0400-$07FF.
+; The first 256 bytes ($4400-$44FF) are then overwritten by the
+; identity table built in Phase 1 of the relocation routine.
+;=============================================================================
+
+;--------------------------------------
+; GAME LOOP DISPATCHER ($4400-$44FF -> $0400)
+; Executable code stored in text page 1 area.
+; Called from L_74E9: dispatches enemy updates + player processing.
+; Entry point varies by timer value for speed scaling:
+;   $0400: 4x enemy updates (timer >= $1E)
+;   $0403: 3x enemy updates (timer >= $14)
+;   $0406: 2x enemy updates (timer >= $0A)
+;   $0409: 1x enemy update  (timer >= $01)
+;--------------------------------------
+
+         HEX 20238E20238E20238E20238E20097E20
+         HEX DD7F203B7620807320238E20238E2023
+         HEX 8E20238E20097E20DD7F200D9320C683
+         HEX 4C1A7578D0F618B904796018A90060FF
+         HEX FF02AD107A8D3D80AD0D7A291FD013AD
+         HEX 0D7A18690FAC0E7A201A80C900D0164C
+         HEX 758018EE0D7AEE0D7AA9008D3C808D3B
+         HEX 80A005EA60C905F0E9A9FF8D3B80AD0D
+         HEX 7A18690FA8AD0E7A18A20F8818AD0E7A
+         HEX C8CAF02F38F90378100549FF186901C9
+         HEX 06B0E9B90479C905F019C900F015B903
+         HEX 78CD0E7AB00869078D0E7A4CBF80E907
+         HEX 8D0E7AAC3D806018A000981899037899
+         HEX 0479C8D0F66060AD0D7A291FD006AD0E
+         HEX 7A4AB006A900A0001860AD0D7AC9A0B0
+         HEX F3984AB00938AD0E7AE9074C0081AD0E
+
+;--------------------------------------
+; TEXT PAGE 1 DATA ($4500-$47FF -> $0500-$07FF)
+; Blank text screen: $A0 = space character
+; Screen holes: $FF bytes at $x78-$x7F (used by Disk II controller)
+; $0700-$077F: Reused as HGR screen save buffer at runtime
+;--------------------------------------
+
+         HEX 7A1869078D6D82CD1C7AF0D8CD1B7AB0
+         HEX D318AD0D7A690F8D6C82AC6D82201A80
+         HEX C900F007297FC905F0BA60A0FFA20FC8
+         HEX B96E7EF02ACAF027AD6D8238F96E7E10
+         HEX 0549FF186901C909B0E5AD6C82D97E7E
+         HEX F09290DB18D98E7EF08AB0D3189085AC
+         HEX 6C8288A20FAD6D82C8CAF01438F90378
+         HEX 100549FF186901C909B0EAA9004CE080
+         HEX A90660AD0E7A4AB003A90060AD107A4A
+         HEX B009AD0E7A38E9074C9D81AD0E7A1869
+         HEX 07A8AD0D7A18690F201A80602CAD0E7A
+         HEX 8DA8814AB0034CEB818C6C82C001D009
+         HEX 18ADA88169074CCB81ADA88138E907A8
+         HEX 8CA881AD0D7A18690F201A80C905F05C
+         HEX C900F0086868AC107A4CFE7AA90060AD
+         HEX 0D7A18690FACA881201A80C905F008C9
+         HEX 00F0034CE0816018AD0D7A690F8D6C82
+         HEX ACA8818C6D8218AD6C826920188D6C82
+         HEX C9AF9003A90560AC6D82201A80C905F0
+         HEX E5C900D003A905604CE0816018AD0D7A
+         HEX 690F8D6C82ACA8818C6D8218AD6C8269
+         HEX 20188D6C82C9AF9003A90060AC6D8220
+         HEX 1A80C905F0E5C900D003A90060A90160
+         HEX 020E00022F0318A2008E3C80C906F006
+         HEX 8C70824C858220C182EE6F82AD6F82CD
+         HEX BC82D00420DA8260CDBD82D004208E84
+         HEX 60CDBF82D006A9FF8D657C60CDBE82D0
+         HEX 0160CDC082D008A9008D6F828D657C60
+         HEX 020406080AAD0D7A18690FA818A20F88
+         HEX 18C8CAF005B90378D0F68C70826018AC
+         HEX 7082B90378D015AD107A4A900918AD0E
+         HEX 7A69074CF88238AD0E7AE90718990378
+         HEX AE7082FE04798D067AAD0D7A69108D05
+         HEX 7A2011836018206D7AAD3A7A8506AD3B
+         HEX 7A8507AD097A0A0A0A0A8D8A830A186D
+         HEX 8A8308186506850628A50769008507AC
+         HEX 7082B90479290FA818B98B8318650685
+         HEX 06A5076900850718A9068D8983A5068D
+         HEX 6C83A5078D6D83AC0A7AA20318B1042D
+         HEX 7A099102C8EE6C83D003EE6D83CAD0EC
+         HEX EE057A203C7ACE8983D0DC6000007018
+         HEX 120F0C0900810A18A9B48D057AA20318
+         HEX 203C7AA000984A9004A9AAD00318A9D5
+         HEX C0209002497F189102C8C026D0E7EE05
+         HEX 7ACAD0DBA9828D91836018EE9283AD92
+         HEX 83C920F00160CE9183A98238ED91838D
+         HEX 067AA9B48D057AA203206D7AAC097AB9
+         HEX 4584AC0A7A1831029102EE057ACAD0E9
+
+;=============================================================================
+; DATA BLOCK: RELOCATED TO $0800-$1FFF ($4800-$5FFF)
+;
+; This 6144-byte block is copied to $0800-$1FFF during Phase 2
+; of the relocation routine. Contains all sprite data, tile patterns,
+; lookup tables, and initialization data used by the game engine.
+;=============================================================================
+
+;--------------------------------------
+; PLATFORM TILE BITMAPS ($4800-$497F -> $0800-$097F)
+; 8 pixel-shift variants of platform/ladder tiles.
+; Each variant: 3 bytes/row x 16 rows = 48 bytes.
+; Used by DRAW_PLAT_TOP and DRAW_PLAT_BOT routines.
+;--------------------------------------
+
+; Shift 0: platform tile shifted 0 pixel(s) right (-> $0800)
+         HEX 00007F00007F00007F00007F00007F00
+         HEX 007F03607F0F787F7F7F7F7F7F7F7F7F
+         HEX 7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F
+
+; Shift 1: platform tile shifted 1 pixel(s) right (-> $0830)
+         HEX 01007E01007E01007E01007E01007E01
+         HEX 007E07407F1F707F7F7F7F7F7F7F7F7F
+         HEX 7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F
+
+; Shift 2: platform tile shifted 2 pixel(s) right (-> $0860)
+         HEX 03007C03007C03007C03007C03007C03
+         HEX 007C0F007F3F607F7F7F7F7F7F7F7F7F
+         HEX 7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F
+
+; Shift 3: platform tile shifted 3 pixel(s) right (-> $0890)
+         HEX 07007807007807007807007807007807
+         HEX 00781F007E7F407F7F7F7F7F7F7F7F7F
+         HEX 7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F
+
+; Shift 4: platform tile shifted 4 pixel(s) right (-> $08C0)
+         HEX 0F00700F00700F00700F00700F00700F
+         HEX 00703F007C7F017F7F7F7F7F7F7F7F7F
+         HEX 7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F
+
+; Shift 5: platform tile shifted 5 pixel(s) right (-> $08F0)
+         HEX 1F00601F00601F00601F00601F00601F
+         HEX 00607F00787F037E7F7F7F7F7F7F7F7F
+         HEX 7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F
+
+; Shift 6: platform tile shifted 6 pixel(s) right (-> $0920)
+         HEX 3F00403F00403F00403F00403F00403F
+         HEX 00407F01707F077C7F7F7F7F7F7F7F7F
+         HEX 7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F
+
+; Shift 7: platform tile shifted 7 pixel(s) right (-> $0950)
+         HEX 7F00007F00007F00007F00007F00007F
+         HEX 00007F03607F0F787F7F7F7F7F7F7F7F
+         HEX 7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F7F
+
+; --- Loader Artifact ($4980 -> $0980) ---
+; Contains 'EDASM.OBJ' text remnant - assembler artifact, not used by game
+         HEX 454441534D2E4F424A22009109FA0080
+         HEX 000000448001FF95000046800A190800
+         HEX 0049008508000000418000FF9500004C
+
+; --- Unused padding ($49B0 -> $09B0) ---
+         HEX 000000000000FFFFFFFFFFFFFFFFFFFF
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+
+;--------------------------------------
+; CHARACTER SPRITE FRAMES ($4A00-$4BFF -> $0A00-$0BFF)
+; Sprite bitmap data for game characters.
+; 7 frames, 64 bytes each (3 bytes wide x 10 rows + 34 bytes padding).
+; Frame 0: Standing/idle
+; Frame 1: Walk right frame 1
+; Frame 2: Walk right frame 2 (arms forward)
+; Frame 3: Digging pose
+; Frame 4: Walk right frame 3
+; Frame 5: Walk right frame 4
+; Frame 6: Falling/jumping
+;--------------------------------------
+
+; Frame 0: Standing/idle (-> $0A00)
+         HEX 0000000000001C1C0000000000000000
+         HEX 001E1C22221C00000000000000000022
+         HEX 1C000000000000003E1E222200000000
+         HEX 00000000000000000000000000000000
+
+; Frame 1: Walk frame 1 (-> $0A40)
+         HEX 00000000000022220000000000000000
+         HEX 00222222222200000000000000000022
+         HEX 08000000000000003022222200000000
+         HEX 00000000000000000000000000000000
+
+; Frame 2: Walk frame 2 (-> $0A80)
+         HEX 00000000000002020000000000000000
+         HEX 00222226220200000000000000000022
+         HEX 08000000000000003022222600000000
+         HEX 00000000000000000000000000000000
+
+; Frame 3: Digging (-> $0AC0)
+         HEX 0000000000001C023E00000000000000
+         HEX 001E222A221C3E00000000000000003E
+         HEX 083E000000000000301E222A00000000
+         HEX 00000000000000000000000000000000
+
+; Frame 4: Walk frame 3 (-> $0B00)
+         HEX 00000000000020020000000000000000
+         HEX 00222232222000000000000000000022
+         HEX 0800000000000000300A223200000000
+         HEX 00000000000000000000000000000000
+
+; Frame 5: Walk frame 4 (-> $0B40)
+         HEX 00000000000022220000000000000000
+         HEX 00222222222200000000000000000022
+         HEX 08000000000000003012222200000000
+         HEX 00000000000000000000000000000000
+
+; Frame 6: Falling/jumping (-> $0B80)
+         HEX 0000000000001C1C0000000000000000
+         HEX 001E1C221C1C00000000000000000022
+         HEX 1C000000000000003E221C2200000000
+         HEX 00000000000000000000000000000000
+
+; --- Empty frame slot ($4BC0 -> $0BC0) ---
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+
+;--------------------------------------
+; BACKGROUND THEME TILE PATTERNS ($4C00-$4D7C -> $0C00-$0D7C)
+; 4 visual themes (+ 4 duplicates of theme 3)
+; Each theme: 48 bytes (3 color layers x 16 bytes)
+; Selected by SELECT_BG_PATTERN based on level/lives.
+; Loaded into level map table at $7E6E during level setup.
+;--------------------------------------
+
+; Theme 0 (-> $0C00)
+         HEX 04182028305050648000000000000000
+         HEX 0F0F8F4F0F2F8F2F0F00000000000000
+         HEX AF2FAF8F4F4FAF6FAF00000000000000
+
+; Theme 1 (-> $0C30)
+         HEX 04040430346076825816000000000000
+         HEX 0F4F8F2F8F0F2F8F2F6F000000000000
+         HEX 2F6FAF6FAF2F6FAFAF8F000000000000
+
+; Theme 2 (-> $0C60)
+         HEX 04142428405860820400000000000000
+         HEX 0F4F0F4F0F2F0F4F8F008F0000000000
+         HEX 6F6F2F8FAF8F2FAFAF00AF0000000000
+
+; Theme 3 (-> $0C90)
+         HEX 04202035405276000000000000000000
+         HEX 0F0F6F8F0F4F0F000000000000000000
+         HEX AF4F8FAF2FAFAF000000000000000000
+
+; Theme 4 (duplicate of theme 3) (-> $0CC0)
+         HEX 04202035405276000000000000000000
+         HEX 0F0F6F8F0F4F0F000000000000000000
+         HEX AF4F8FAF2FAFAF000000000000000000
+
+; Theme 5 (duplicate of theme 3) (-> $0CF0)
+         HEX 04202035405276000000000000000000
+         HEX 0F0F6F8F0F4F0F000000000000000000
+         HEX AF4F8FAF2FAFAF000000000000000000
+
+; Theme 6 (duplicate of theme 3) (-> $0D20)
+         HEX 04202035405276000000000000000000
+         HEX 0F0F6F8F0F4F0F000000000000000000
+         HEX AF4F8FAF2FAFAF000000000000000000
+
+; Theme 7 (duplicate of theme 3) (-> $0D50)
+         HEX 04202035405276000000000000000000
+         HEX 0F0F6F8F0F4F0F000000000000000000
+         HEX AF4F8FAF2FAFAF000000000000000000
+
+;--------------------------------------
+; RUNTIME SCRATCH AREA ($4D7D-$4FFF -> $0D7D-$0FFF)
+; Contains residual DOS code that is overwritten at runtime.
+; $0E00-$0E7F: Enemy spawn position table (populated during level setup)
+;--------------------------------------
+
+         HEX 000000C98DD0F560A98DC512F0034C2C
+         HEX 0DA9008501201C0D8500F00CC928D005
+         HEX 20770DA5004C0013A9A0A2109DB803CA
+         HEX 10FAA97F855B207E0FA98D8DC60FA900
+         HEX 8DC70F20840FA20638CA3016BDC30329
+         HEX 3FF86900D8C9409002497009809DC303
+         HEX B0E720810FA9AC8DC60FA9A08DC70F20
+         HEX 840F207E0F20870FA002A670E00D900E
+         HEX B9700010464086806630065046208670
+         HEX 26502640267086106630065046208670
+         HEX 26502670462086506640063046608630
+         HEX 26500610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26502610464086806630065046208670
+         HEX 26508612C98DF0F4D0DAA512C98DF01A
+         HEX A0008410BD0002E8C98DF00EC512F00C
+         HEX 208D0EC610D0ED4C2C0DCA18A9004C8D
+         HEX 0EA9208510A001845CD007A000845C20
+         HEX 120D20280E9004A45CF017C610F0D820
+         HEX 730FC9FFF0E5C900D008A45C30C9A0FF
+         HEX 30DBA9FF208D0E208D0ECAA9008518A9
+         HEX 0885194CB90C20860EA51238E9AD4C8D
+         HEX 0EA2002CA2082CA2102CA2772CA283BD
+         HEX A00FF00620EDFDE8D0F560208C0FA26E
+         HEX 4C8C0F8D84C2CCCFC1C4008D84C2D3C1
+         HEX D6C500C1D3CDC9C4D3D4C1CDD0ACD3B6
+         HEX ACC4B1ACC1A4B3C2B88D00CCB1B78D00
+         HEX C3CDC4A0D3D9CED4C1D800CED5CDC5D2
+         HEX C9C3A0CFD6C5D2C6CCCFD700D0C1D2C1
+         HEX CDC5D4C5D2A8D3A9A0CFCDC9D4D4C5C4
+         HEX 00D5CE
+
+;--------------------------------------
+; ENEMY SPRITE DATA ($4FFD-$55FF -> $0FFD-$15FF)
+; 3 enemy types, 512 bytes each (8 shift variants x 2 anim frames)
+; 3 bytes wide x 10 rows = 30 bytes per shifted frame
+; Type 0: Apple  (-> $1000) — "Little Apples" from the manual
+; Type 1: Butterfly (-> $1200) — "Green Butterfly"
+; Type 2: Mask   (-> $1400) — "Mask of Death"
+;--------------------------------------
+
+; Padding/alignment bytes (-> $0FFD)
+         HEX 00D5CE
+
+; Apple sprites (-> $1000) — "Little Apples"
+;   shift 0, anim 0 (-> $1000)
+         HEX 85A88091A280908280A08180A8858092
+         HEX 9080929080829080AA9580A291800000
+;   shift 0, anim 1 (-> $1020)
+         HEX 8AD080A2C480A08480C08280D08A80A4
+         HEX A080A4A08084A080D4AA80A0A2800000
+;   shift 1, anim 0 (-> $1040)
+         HEX 94A081C48881C08880808580A09580C8
+         HEX C080C8C08088C080A8D58088C5800000
+;   shift 1, anim 1 (-> $1060)
+         HEX A8C082889182809180808A80C0AA8090
+         HEX 8181908181908081D0AA81908A810000
+;   shift 2, anim 0 (-> $1080)
+         HEX D0808590A28480A28080948080D580A0
+         HEX 8282A08282A08082A0D582A094820000
+;   shift 2, anim 1 (-> $10A0)
+         HEX A0818AA0C48880C48080A88080AA81C0
+         HEX 8484C08484C08084C0AA85C0A8840000
+;   shift 3, anim 0 (-> $10C0)
+         HEX C08294C0889180888180D08080D48280
+         HEX 898880898880818880D58A80D1880000
+;   shift 3, anim 1 (-> $10E0)
+         HEX 8085A88091A280908280A08180A88580
+         HEX 929080929080829080AA9580A2910000
+;   shift 4, anim 0 (-> $1100)
+         HEX 81A08081A08095AA80A08180A8858082
+         HEX 9280829280829080AA95808884800000
+;   shift 4, anim 1 (-> $1120)
+         HEX 82C08082C080AAD480C08280D08A8084
+         HEX A48084A48084A080D4AA809088800000
+;   shift 5, anim 0 (-> $1140)
+         HEX 848081848081D4A881808580A0958088
+         HEX C88088C88088C080A8D580A090800000
+;   shift 5, anim 1 (-> $1160)
+         HEX 888082888082A8D182808A80C0AA8090
+         HEX 9081909081908081D0AA81C0A0800000
+;   shift 6, anim 0 (-> $1180)
+         HEX 908084908084D0A28580948080D580A0
+         HEX A082A0A082A08082A0D58280C1800000
+;   shift 6, anim 1 (-> $11A0)
+         HEX A08088A08088A0C58A80A88080AA81C0
+         HEX C084C0C084C08084C0AA858082810000
+;   shift 7, anim 0 (-> $11C0)
+         HEX C08090C08090C08A9580D08080D48280
+         HEX 818980818980818880D58A8084820000
+;   shift 7, anim 1 (-> $11E0)
+         HEX 8081A08081A08095AA80A08180A88580
+         HEX 829280829280829080AA958088840000
+
+; Butterfly sprites (-> $1200) — "Green Butterfly"
+;   shift 0, anim 0 (-> $1200)
+         HEX 0810000810002A54002A540012490002
+         HEX 41002A5500281500A894808AD0800000
+;   shift 0, anim 1 (-> $1220)
+         HEX 10200010200054280154280124120104
+         HEX 0201542A01502A00D0A88094A0810000
+;   shift 1, anim 0 (-> $1240)
+         HEX 20400020400028510228510248240208
+         HEX 0402285502205500A0D180A8C0820000
+;   shift 1, anim 1 (-> $1260)
+         HEX 40000140000150220550220510490410
+         HEX 0804502A05402A01C0A281D080850000
+;   shift 2, anim 0 (-> $1280)
+         HEX 00010200010220450A20450A20120920
+         HEX 100820550A00550280C582A0818A0000
+;   shift 2, anim 1 (-> $12A0)
+         HEX 000204000204400A15400A1540241240
+         HEX 2010402A15002A05808A85C082940000
+;   shift 3, anim 0 (-> $12C0)
+         HEX 00040800040800152A00152A00492400
+         HEX 412000552A00540A80948A8085A80000
+;   shift 3, anim 1 (-> $12E0)
+         HEX 000810000810002A54002A5400124900
+         HEX 0241002A5500281580A894808AD00000
+;   shift 4, anim 0 (-> $1300)
+         HEX 0240000A50000A50002A540002410012
+         HEX 49002A5500281500A89480A084800000
+;   shift 4, anim 1 (-> $1320)
+         HEX 04000114200114200154280104020124
+         HEX 1201542A01502A00D0A880C088800000
+;   shift 5, anim 0 (-> $1340)
+         HEX 08000228400228400228510208040248
+         HEX 2402285502205500A0D1808091800000
+;   shift 5, anim 1 (-> $1360)
+         HEX 10000450000550000550220510080410
+         HEX 4904502A05402A01C0A28180A2800000
+;   shift 6, anim 0 (-> $1380)
+         HEX 20000820010A20010A20450A20100820
+         HEX 120920550A00550280C58280C4800000
+;   shift 6, anim 1 (-> $13A0)
+         HEX 400010400214400214400A1540201040
+         HEX 2412402A15002A05808A858088810000
+;   shift 7, anim 0 (-> $13C0)
+         HEX 00012000052800052800152A00412000
+         HEX 492400552A00540A80948A8090820000
+;   shift 7, anim 1 (-> $13E0)
+         HEX 000240000A50000A50002A5400024100
+         HEX 1249002A5500281580A89480A0840000
+
+; Mask sprites (-> $1400) — "Mask of Death"
+;   shift 0, anim 0 (-> $1400)
+         HEX 81A08085A88085A880A5A980A4898084
+         HEX 8880948A80C48880C1A08081A0800000
+;   shift 0, anim 1 (-> $1420)
+         HEX 82C0808AD0808AD080CAD280C8928088
+         HEX 9080A8948088918082C18082C0800000
+;   shift 1, anim 0 (-> $1440)
+         HEX 84808194A08194A08194A58190A58090
+         HEX A080D0A88090A2808482818480810000
+;   shift 1, anim 1 (-> $1460)
+         HEX 888082A8C082A8C082A8CA82A0CA80A0
+         HEX C080A0D180A0C4808884828880820000
+;   shift 2, anim 0 (-> $1480)
+         HEX 908084D08085D08085D09485C09481C0
+         HEX 8081C0A281C088819088849080840000
+;   shift 2, anim 1 (-> $14A0)
+         HEX A08088A0818AA0818AA0A98A80A98280
+         HEX 818280C582809182A09088A080880000
+;   shift 3, anim 0 (-> $14C0)
+         HEX C08090C08294C08294C0D29480D28480
+         HEX 8284808A8580A284C0A090C080900000
+;   shift 3, anim 1 (-> $14E0)
+         HEX 8081A08085A88085A880A5A980A48980
+         HEX 848880948A80C48880C1A08081A00000
+;   shift 4, anim 0 (-> $1500)
+         HEX 848880948A8095AA8095AA80A48980A4
+         HEX 8980948A80C48880D082809082800000
+;   shift 4, anim 1 (-> $1520)
+         HEX 889080A89480AAD480AAD480C89280C8
+         HEX 9280A89480889180A08580A084800000
+;   shift 5, anim 0 (-> $1540)
+         HEX 90A080D0A880D4A881D4A88190A58090
+         HEX A580D0A88090A280C08A80C088800000
+;   shift 5, anim 1 (-> $1560)
+         HEX A0C080A0D180A8D182A8D182A0CA80A0
+         HEX CA80A0D180A0C4808095808091800000
+;   shift 6, anim 0 (-> $1580)
+         HEX C08081C0A281D0A285D0A285C09481C0
+         HEX 9481C0A281C0888180AA8080A2800000
+;   shift 6, anim 1 (-> $15A0)
+         HEX 80818280C582A0C58AA0C58A80A98280
+         HEX A98280C58280918280D48080C4800000
+;   shift 7, anim 0 (-> $15C0)
+         HEX 808284808A85C08A95C08A9580D28480
+         HEX D284808A8580A28480A8818088810000
+;   shift 7, anim 1 (-> $15E0)
+         HEX 80848880948A8095AA8095AA80A48980
+         HEX A48980948A80C48880D0828090820000
+
+;--------------------------------------
+; SPRITE TRANSPARENCY MASKS ($5600-$56FF -> $1600-$16FF)
+; AND mask for background preservation during enemy rendering.
+; 8 shift variants x 30 bytes = 240 bytes of mask data.
+; Remaining 16 bytes are padding.
+;--------------------------------------
+
+; Mask shift 0 (-> $1600)
+         HEX 00407F00407F00407F00407F00407F00
+         HEX 407F00407F00407F00407F00407F
+; Mask shift 1 (-> $161E)
+         HEX 7F7F01007F01007F01007F01007F0100
+         HEX 7F01007F01007F01007F01007F01
+; Mask shift 2 (-> $163C)
+         HEX 007F7F7F03007E03007E03007E03007E
+         HEX 03007E03007E03007E03007E0300
+; Mask shift 3 (-> $165A)
+         HEX 7E03007E7F7F07007C07007C07007C07
+         HEX 007C07007C07007C07007C07007C
+; Mask shift 4 (-> $1678)
+         HEX 07007C07007C7F7F0F00780F00780F00
+         HEX 780F00780F00780F00780F00780F
+; Mask shift 5 (-> $1696)
+         HEX 00780F00780F00787F7F1F00701F0070
+         HEX 1F00701F00701F00701F00701F00
+; Mask shift 6 (-> $16B4)
+         HEX 701F00701F00701F00707F7F3F00603F
+         HEX 00603F00603F00603F00603F0060
+; Mask shift 7 (-> $16D2)
+         HEX 3F00603F00603F00603F00607F7F7F00
+         HEX 407F00407F00407F00407F00407F
+; Padding
+         HEX 00407F00407F00407F00407F00407F00
+
+;--------------------------------------
+; SOLID FILL PATTERN ($5700-$57FF -> $1700-$17FF)
+; Repeating 4-byte pattern: FF FF 00 00
+; Used by screen fill routines for striped fill effect.
+;--------------------------------------
+
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+         HEX FFFF0000FFFF0000FFFF0000FFFF0000
+
+;--------------------------------------
+; IDENTITY LOOKUP TABLE ($5800-$58FF -> $1800-$18FF)
+; Sequential values $00-$FF: table[n] = n
+; Used as lookup table via zero-page indirect addressing:
+;   LDA (ptr),Y with ptr pointing here returns Y in A
+; Note: The relocation routine also builds a second identity
+; table at $4400 (overwriting the game loop source data).
+;--------------------------------------
+
+         HEX 000102030405060708090A0B0C0D0E0F  ; $00-$0F
+         HEX 101112131415161718191A1B1C1D1E1F  ; $10-$1F
+         HEX 202122232425262728292A2B2C2D2E2F  ; $20-$2F
+         HEX 303132333435363738393A3B3C3D3E3F  ; $30-$3F
+         HEX 404142434445464748494A4B4C4D4E4F  ; $40-$4F
+         HEX 505152535455565758595A5B5C5D5E5F  ; $50-$5F
+         HEX 606162636465666768696A6B6C6D6E6F  ; $60-$6F
+         HEX 707172737475767778797A7B7C7D7E7F  ; $70-$7F
+         HEX 808182838485868788898A8B8C8D8E8F  ; $80-$8F
+         HEX 909192939495969798999A9B9C9D9E9F  ; $90-$9F
+         HEX A0A1A2A3A4A5A6A7A8A9AAABACADAEAF  ; $A0-$AF
+         HEX B0B1B2B3B4B5B6B7B8B9BABBBCBDBEBF  ; $B0-$BF
+         HEX C0C1C2C3C4C5C6C7C8C9CACBCCCDCECF  ; $C0-$CF
+         HEX D0D1D2D3D4D5D6D7D8D9DADBDCDDDEDF  ; $D0-$DF
+         HEX E0E1E2E3E4E5E6E7E8E9EAEBECEDEEEF  ; $E0-$EF
+         HEX F0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF  ; $F0-$FF
+
+;--------------------------------------
+; GAME STATE VARIABLES ($5900-$5FFF -> $1900-$1FFF)
+; Mostly zeroed at load time. Game initialization populates
+; these during GAME_INIT and LEVEL_SETUP.
+; $5E00-$5FFF ($1E00-$1FFF) contains Applesoft BASIC runtime
+; code (not used by the game, residual from DOS loading).
+;--------------------------------------
+
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000040
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000005
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 00000000000000000000000000000000
+         HEX 9D75AACA10F7ADB1AA8D57AA20D4A7AD
+         HEX B3AAF00948209DA668A0009140205BA7
+         HEX AD5FAAD020A22FBD519E9DD003CA10F7
+         HEX AD539E8DF30349A58DF403AD529E8DF2
+         HEX 03A906D005AD62AAF0068D5FAA4C80A1
+         HEX 604CBF9D4C849D4CFDAA4CB5B7AD0F9D
+         HEX AC0E9D60ADC2AAACC1AA604C51A8EAEA
+         HEX 4C59FA4C65FF4C58FF4C65FF4C65FF65
+         HEX FF20D19EAD51AAF01548AD5CAA912868
+         HEX 30034C26A620EA9DA424A9609128ADB3
+         HEX AAF0032082A6A9038D52AA20BA9F20BA
+         HEX 9E8D5CAA8E5AAA4CB39F6C380020D19E
+         HEX AD52AA0AAABD119D48BD109D48AD5CAA
+         HEX 608D5CAA8E5AAA8C5BAABAE8E88E59AA
+         HEX A203BD53AA9536CA10F860AEB7AAF003
+         HEX 4C789FAE51AAF008C9BFF075C533F027
+         HEX A2028E52AACDB2AAD019CA8E52AACA8E
+         HEX 5DAAAE5DAA9D0002E88E5DAAC98DD075
+         HEX 4CCD9FC98DD07DA2008E52AA4CA49FA2
+         HEX 008E52AAC98DF007ADB3AAF067D05E48
+         HEX 38ADB3AAD003205EA66890ECAE5AAA4C
+         HEX 159FC98DD005A9058D52AA200EA64C99
+         HEX 9FCDB2AAF085C98AF0F1A2048E52AAD0
+         HEX E1A9008D52AAF025A9008DB7AA2051A8
+         HEX 4CDCA4AD0002CDB2AAF00AA98D8D0002
+         HEX A2008E5AAAA940D006A910D002A9202D
+         HEX 5EAAF00F20BA9F20C59F8D5CAA8C5BAA
+         HEX 8E5AAA2051A8AE59AA9AAD5CAAAC5BAA
+         HEX AE5AAA38606C3600A98D4CC59FA0FF8C
+         HEX 5FAAC88C62AAEE5FAAA20008BD0002CD
+         HEX B2AAD001E88E5DAA20A4A1297F5984A8
+         HEX C80AF002680890F028F020B984A8D0D6
+
+;=============================================================================
+; MAIN GAME CODE AND DATA ($6000-$A7FF)
+;
+; This region stays at $6000-$A7FF and is NOT relocated.
+; Contains:
+;   $6000-$6EFF: Player sprite data (pre-shifted HGR bitmaps)
+;   $6F00-$6FBF: Platform tile masks and patterns
+;   $6FC0-$6FFF: Additional tile patterns
+;   $7000-$7002: GAME_START (JMP GAME_INIT)
+;   $7003-$7062: Font & icon data
+;   $7063-$706A: HGR calc variables
+;   $706B-$A7FF: All game logic (104 named subroutines)
+;
+; All comments, labels, and section headers derived from recursive
+; descent disassembly of the original disk boot memory.
+;=============================================================================
+
+         ORG  $6000
+
+
+PLR_WALK_R0                          ; Walk right frame 0 (7 shifts x 48 bytes)
+         HEX 7003003007007063006061004030007C
+         HEX 1F00660100630100630100701F003018
+         HEX 00301800301800303800300000700000
+
+PLR_WALK_R0_S1                          ; pixel shift 1
+         HEX 600700600E0060470140430100610078
+         HEX 3F004C0300460300460300603F006030
+         HEX 00603000603000607000600000600100
+
+PLR_WALK_R0_S2                          ; pixel shift 2
+         HEX 400F00401D00400F0300070300420170
+         HEX 7F001807000C07000C0700407F004061
+         HEX 00406100406100406101400100400300
+
+PLR_WALK_R0_S3                          ; pixel shift 3
+         HEX 001F00003B00001F06000E0600040360
+         HEX 7F01300E00180E00180E00007F010043
+         HEX 01004301004301004303000300000700
+
+PLR_WALK_R0_S4                          ; pixel shift 4
+         HEX 003E00007600003E0C001C0C00080640
+         HEX 7F03601C00301C00301C00007E030006
+         HEX 03000603000603000607000600000E00
+
+PLR_WALK_R0_S5                          ; pixel shift 5
+         HEX 007C00006C01007C1800381800100C00
+         HEX 7F07403900603800603800007C07000C
+         HEX 06000C06000C06000C0E000C00001C00
+
+PLR_WALK_R0_S6                          ; pixel shift 6
+         HEX 00780100580300783100703000201800
+         HEX 7E0F00730040710040710000780F0018
+         HEX 0C00180C00180C00181C001800003800
+
+PLR_WALK_R0B                          ; Walk right frame 0 continued
+         HEX 00700300300700706300606100403000
+         HEX 7C1F00660100630100630100701F0030
+         HEX 18003018003018003038003000007000
+         HEX 70030030070070030060010040000078
+         HEX 67006C6D006639006C01007007003006
+         HEX 003006003F0600010600000600000E00
+         HEX 600700600E0060070040030000010070
+         HEX 4F01585B014C7300580300600F00600C
+         HEX 00600C007E0C00020C00000C00001C00
+         HEX 400F00401D00400F0000070000020060
+         HEX 1F03303703186701300700401F004019
+         HEX 004019007C1900041800001800003800
+         HEX 001F00003B00001F00000E0000040040
+         HEX 3F06606E06304E03600E00003F000033
+         HEX 00003300783300083000003000007000
+         HEX 003E00007600003E00001C0000080000
+         HEX 7F0C405D0D601C07401D00007E000066
+         HEX 00006600706700106000006000006001
+         HEX 007C00006C01007C0000380000100000
+         HEX 7E19003B1B40390E003B00007C01004C
+         HEX 01004C01604F01204001004001004003
+         HEX 00780100580300780100700000200000
+         HEX 7C3300763600731C0076000078030018
+         HEX 03001803401F03400003000003000007
+         HEX 00700300300700700300600100400000
+         HEX 7867006C6D006639006C010070070030
+         HEX 06003006003F0600010600000600000E
+
+PLR_WALK_R1                          ; Walk right frame 1 (also walk left frame 0)
+         HEX 6007007006006307004303000601007C
+         HEX 1F004033004063004063007C07000C06
+         HEX 000C06000C06000E0600000600000700
+
+PLR_WALK_R1_S1                          ; pixel shift 1
+         HEX 400F00600D00460F000607000C020078
+         HEX 3F00006700004701004701780F00180C
+         HEX 00180C00180C001C0C00000C00000E00
+
+PLR_WALK_R1_S2                          ; pixel shift 2
+         HEX 001F00401B000C1F000C0E0018040070
+         HEX 7F00004E01000E03000E03701F003018
+         HEX 00301800301800381800001800001C00
+
+PLR_WALK_R1_S3                          ; pixel shift 3
+         HEX 003E00003700183E00181C0030080060
+         HEX 7F01001C03001C06001C06603F006030
+         HEX 00603000603000703000003000003800
+
+PLR_WALK_R1_S4                          ; pixel shift 4
+         HEX 007C00006E00307C0030380060100040
+         HEX 7F0300380600380C00380C407F004061
+         HEX 00406100406100606100006000007000
+
+PLR_WALK_R1_S5                          ; pixel shift 5
+         HEX 007801005C0160780160700040210000
+         HEX 7F0700700C007018007018007F010043
+         HEX 01004301004301404301004001006001
+
+PLR_WALK_R1_S6                          ; pixel shift 6
+         HEX 00700300380340710340610100430000
+         HEX 7E0F006019006031006031007E030006
+         HEX 03000603000603000703000003004003
+
+PLR_WALK_R1B                          ; Walk right frame 1 continued
+         HEX 00600700700600630700430300060100
+         HEX 7C1F004033004063004063007C07000C
+         HEX 06000C06000C06000E06000006000007
+         HEX 60070070060060070040030000010073
+         HEX 0F005B1B004E3300401B007007003006
+         HEX 00300600307E00304000300000380000
+         HEX 400F00600D00400F0000070000020066
+         HEX 1F003637001C6700003700600F00600C
+         HEX 00600C00607C01600001600000700000
+         HEX 001F00401B00001F00000E000004004C
+         HEX 3F006C6E00384E01006E00401F004019
+         HEX 00401900407903400102400100600100
+         HEX 003E00003700003E00001C0000080018
+         HEX 7F00585D01701C03005C01003F000033
+         HEX 00003300007307000304000300400300
+         HEX 007C00006E00007C0000380000100030
+         HEX 7E01303B03603906003803007E000066
+         HEX 0000660000660F000608000600000700
+         HEX 007801005C0100780100700000200060
+         HEX 7C0360760640730C007006007C01004C
+         HEX 01004C01004C1F000C10000C00000E00
+         HEX 00700300380300700300600100400040
+         HEX 7907406D0D00671900600D0078030018
+         HEX 0300180300183F001820001800001C00
+         HEX 00600700700600600700400300000100
+         HEX 730F005B1B004E3300401B0070070030
+         HEX 0600300600307E003040003000003800
+
+PLR_CLIMB_0                          ; Climb frame 0 (7 shifts x 48 bytes)
+         HEX 601900701B00701B00601900400C007C
+         HEX 0700660100660100660100761F003018
+         HEX 00301800301800300000300000300000
+
+PLR_CLIMB_0_S1                          ; pixel shift 1
+         HEX 40330060370060370040330000190078
+         HEX 0F004C03004C03004C03006C3F006030
+         HEX 00603000603000600000600000600000
+
+PLR_CLIMB_0_S2                          ; pixel shift 2
+         HEX 006700406F00406F0000670000320070
+         HEX 1F00180700180700180700587F004061
+         HEX 00406100406100400100400100400100
+
+PLR_CLIMB_0_S3                          ; pixel shift 3
+         HEX 004E01005F01005F01004E0100640060
+         HEX 3F00300E00300E00300E00307F010043
+         HEX 01004301004301000300000300000300
+
+PLR_CLIMB_0_S4                          ; pixel shift 4
+         HEX 001C03003E03003E03001C0300480140
+         HEX 7F00601C00601C00601C00607E030006
+         HEX 03000603000603000600000600000600
+
+PLR_CLIMB_0_S5                          ; pixel shift 5
+         HEX 003806007C06007C0600380600100300
+         HEX 7F01403900403900403900407D07000C
+         HEX 06000C06000C06000C00000C00000C00
+
+PLR_CLIMB_0_S6                          ; pixel shift 6
+         HEX 00700C00780D00780D00700C00200600
+         HEX 7E03007300007300007300007B0F0018
+         HEX 0C00180C00180C001800001800001800
+
+PLR_CLIMB_0B                          ; Climb frame 0 continued
+         HEX 00601900701B00701B00601900400C00
+         HEX 7C0700660100660100660100761F0030
+         HEX 18003018003018003000003000003000
+         HEX 6601007603007603006601004C000078
+         HEX 0F006019006019006019007E1B000603
+         HEX 00060300060300000300000300000300
+         HEX 4C03006C07006C07004C030018010070
+         HEX 1F004033004033004033007C37000C06
+         HEX 000C06000C0600000600000600000600
+         HEX 180700580F00580F0018070030020060
+         HEX 3F00006700006700006700786F00180C
+         HEX 00180C00180C00000C00000C00000C00
+         HEX 300E00301F00301F00300E0060040040
+         HEX 7F00004E01004E01004E01705F013018
+         HEX 00301800301800001800001800001800
+         HEX 601C00603E00603E00601C0040090000
+         HEX 7F01001C03001C03001C03603F036030
+         HEX 00603000603000003000003000003000
+         HEX 403900407D00407D0040390000130000
+         HEX 7E03003806003806003806407F064061
+         HEX 00406100406100006000006000006000
+         HEX 007300007B01007B0100730000260000
+         HEX 7C0700700C00700C00700C007F0D0043
+         HEX 01004301004301004001004001004001
+         HEX 006601007603007603006601004C0000
+         HEX 780F006019006019006019007E1B0006
+         HEX 03000603000603000003000003000003
+
+PLR_DIG_L0                          ; Dig left frame 0 (7 shifts x 48 bytes)
+         HEX 7C00006C01007C00003800001000007C
+         HEX 01003C03007806007807003806006C0C
+         HEX 006C18006C70006C70006C60006E4100
+
+PLR_DIG_L0_S1                          ; pixel shift 1
+         HEX 78010058030078010070000020000078
+         HEX 0300780600700D00700F00700C005819
+         HEX 005831005861015861015841015C0301
+
+PLR_DIG_L0_S2                          ; pixel shift 2
+         HEX 70030030070070030060010040000070
+         HEX 0700700D00601B00601F006019003033
+         HEX 00306300304303304303300303380702
+
+PLR_DIG_L0_S3                          ; pixel shift 3
+         HEX 600700600E0060070040030000010060
+         HEX 0F00601B00403700403F004033006066
+         HEX 00604601600607600607600606700E04
+
+PLR_DIG_L0_S4                          ; pixel shift 4
+         HEX 400F00401D00400F0000070000020040
+         HEX 1F00403700006F00007F00006700404D
+         HEX 01400D03400D0E400D0E400D0C601D08
+
+PLR_DIG_L0_S5                          ; pixel shift 5
+         HEX 001F00003B00001F00000E0000040000
+         HEX 3F00006F00005E01007E01004E01001B
+         HEX 03001B06001B1C001B1C001B18403B10
+
+PLR_DIG_L0_S6                          ; pixel shift 6
+         HEX 003E00007600003E00001C0000080000
+         HEX 7E00005E01003C03007C03001C030036
+         HEX 0600360C003638003638003630007720
+
+PLR_DIG_L0B                          ; Dig left frame 0 continued
+         HEX 007C00006C01007C0000380000100000
+         HEX 7C01003C03007806007807003806006C
+         HEX 0C006C18006C70006C70006C60006E41
+         HEX 7C60006C71007C7800380C0010060078
+         HEX 07003806007803003800003800006C00
+         HEX 006C00006C00006C00006C00006E0100
+         HEX 784101586301787101701800200C0070
+         HEX 0F00700C007007007000007000005801
+         HEX 005801005801005801005801005C0300
+         HEX 70030330470370630360310040180060
+         HEX 1F00601900600F006001006001003003
+         HEX 00300300300300300300300300380700
+         HEX 600706600E0760470740630000310040
+         HEX 3F00403300401F004003004003006006
+         HEX 00600600600600600600600600700E00
+         HEX 400F0C401D0E400F0F00470100620000
+         HEX 7F00006700003F00000700000700400D
+         HEX 00400D00400D00400D00400D00601D00
+         HEX 001F18003B1C001F1E000E0300440100
+         HEX 7E01004E01007E00000E00000E00001B
+         HEX 00001B00001B00001B00001B00403B00
+         HEX 003E30007638003E3C001C0600080300
+         HEX 7C03001C03007C01001C00001C000036
+         HEX 00003600003600003600003600007700
+         HEX 007C60006C71007C7800380C00100600
+         HEX 7807003806007803003800003800006C
+         HEX 00006C00006C00006C00006C00006E01
+
+PLR_DIG_L1                          ; Dig left frame 1 (7 shifts x 48 bytes)
+         HEX 001F00401B00001F00000E00001F0040
+         HEX 1E00600F00300F00700E00301B00181B
+         HEX 000C1B00071B00071B00031B00413B00
+
+PLR_DIG_L1_S1                          ; pixel shift 1
+         HEX 003E00003700003E00001C00003E0000
+         HEX 3D00401F00601E00601D006036003036
+         HEX 001836000E36000E3600063600027700
+
+PLR_DIG_L1_S2                          ; pixel shift 2
+         HEX 007C00006E00007C00003800007C0000
+         HEX 7A00003F00403D00403B00406D00606C
+         HEX 00306C001C6C001C6C000C6C00046E01
+
+PLR_DIG_L1_S3                          ; pixel shift 3
+         HEX 007801005C0100780100700000780100
+         HEX 7401007E00007B00007700005B014059
+         HEX 01605801385801385801185801085C03
+
+PLR_DIG_L1_S4                          ; pixel shift 4
+         HEX 00700300380300700300600100700300
+         HEX 6803007C01007601006E010036030033
+         HEX 03403103703003703003303003103807
+
+PLR_DIG_L1_S5                          ; pixel shift 5
+         HEX 00600700700600600700400300600700
+         HEX 5007007803006C03005C03006C060066
+         HEX 0600630660610660610660600620700E
+
+PLR_DIG_L1_S6                          ; pixel shift 6
+         HEX 00400F00600D00400F00000700400F00
+         HEX 200F00700700580700380700580D004C
+         HEX 0D00460D40430D40430D40410D40601D
+
+PLR_DIG_L1B                          ; Dig left frame 1 continued
+         HEX 00001F00401B00001F00000E00001F00
+         HEX 401E00600F00300F00700E00301B0018
+         HEX 1B000C1B00071B00071B00031B00413B
+         HEX 031F00471B000F1F00180E0030040070
+         HEX 0F00600E00600F00000E00000E00001B
+         HEX 00001B00001B00001B00001B00403B00
+         HEX 063E000E37001E3E00301C0060080060
+         HEX 1F00401D00401F00001C00001C000036
+         HEX 00003600003600003600003600007700
+         HEX 0C7C001C6E003C7C0060380040110040
+         HEX 3F00003B00003F00003800003800006C
+         HEX 00006C00006C00006C00006C00006E01
+         HEX 187801385C0178780140710000230000
+         HEX 7F00007600007E000070000070000058
+         HEX 01005801005801005801005801005C03
+         HEX 30700370380370710300630100460000
+         HEX 7E01006C01007C010060010060010030
+         HEX 03003003003003003003003003003807
+         HEX 606007607106606307004603000C0100
+         HEX 7C030058030078030040030040030060
+         HEX 0600600600600600600600600600700E
+         HEX 40410F40630D40470F000C0700180200
+         HEX 78070030070070070000070000070040
+         HEX 0D00400D00400D00400D00400D00601D
+         HEX 00031F00471B000F1F00180E00300400
+         HEX 700F00600E00600F00000E00000E0000
+         HEX 1B00001B00001B00001B00001B00403B
+
+;=============================================================================
+; PLATFORM TILE GRAPHICS ($6F00-$6FBF)
+; Masks and patterns for platform/ladder rendering
+; Used by DRAW_PLAT_TOP and DRAW_PLAT_BOT
+;=============================================================================
+
+PLAT_TILE_MASK                    ; AND mask ($6F00-$6F3F)
+         HEX 00407F7F01007F7F03007E7F07007C7F
+         HEX 0F00787F1F00707F3F00607F7F00407F
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+PLAT_TILE_TOP                     ; Top half pattern ($6F40-$6F7F)
+         HEX 01200000024000000400010008000200
+         HEX 10000400200008004000100000012000
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+PLAT_TILE_BOT                     ; Bottom half pattern ($6F80-$6FBF)
+         HEX 552A00002A550000542A010028550200
+         HEX 502A050020550A00402A150000552A00
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+TILE_EXTRA                        ; Additional tile patterns ($6FC0-$6FFF)
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+         HEX FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+
+;=============================================================================
+; MAIN GAME CODE ($7000-$A7FF)
+; All game logic: rendering, sound, AI, input, scoring.
+; Entry: GAME_START ($7000) -> JMP GAME_INIT ($7465)
+;=============================================================================
+
+
+;--------------------------------------
+; ===== GAME ENTRY - jumps to initialization =====
+;--------------------------------------
+GAME_START
+         JMP GAME_INIT
+
+;--------------------------------------
+; FONT & ICON DATA ($7003-$7062)
+; 8 bytes per char: digits 0-9, blank,
+; player icon for lives display
+;--------------------------------------
+         HEX 000E111111110E000C0A080808081C00
+         HEX 0E11100806011F000E11100C10110E00
+         HEX 0109091F080808000F01010F10100F00
+         HEX 0E11010F11110E001F11100808040400
+         HEX 0E11110E11110E000E11111E10110E00
+         HEX 00000000000000001C1C493E08142241
+
+;--------------------------------------
+; HGR CALC VARIABLES ($7063-$706A)
+; $7063=Y-row  $7064=X-col  $7067=bit-pos
+; $7068=byte-col  $7069=page1-hi  $706A=page2-hi
+;--------------------------------------
+         HEX C0510000011B2040
+
+;--------------------------------------
+; ===== HGR ADDRESS CALCULATION =====
+; Converts Y-row in $7063 to HGR screen address in $02-$05
+;--------------------------------------
+HGR_CALC_ADDR
+         LDA $7063
+         PHA
+         AND #$C0
+         STA $02
+         LSR
+         LSR
+         ORA $02
+         STA $02
+         PLA
+         STA $03
+         ASL
+         ASL
+         ASL
+         ROL $03
+         ASL
+         ROL $03
+         ASL
+         ROR $02
+         LDA $02
+         STA $04
+         LDA $03
+         AND #$1F
+         PHA
+         ORA $7069
+         STA $03
+         PLA
+         ORA $706A
+         STA $05
+         RTS
+HGR_LINE_SETUP
+         JSR HGR_CALC_ADDR              ; Setup HGR line - computes column offset and bit position
+         LDY #$00
+         LDA $7064
+         ASL
+         BCC L_70AD
+         CLC
+         LDY #$23
+         ADC #$04
+L_70AC
+         INY
+L_70AD
+         SBC #$07
+         BCS L_70AC
+         ADC #$08
+         CLC
+         STY $7068
+         STA $7067
+         RTS
+SCORE_DIGITS
+         HEX 000000000000
+HISCORE_DIGITS
+         HEX 000000000000
+BONUS_PENALTY
+         HEX 02
+BONUS_DIGITS
+         HEX 02000000
+DISPLAY_POS
+         ASL $08B8
+         BRK
+SPLIT_DIGITS
+         CLC                            ; Split accumulator into tens/ones digits for display
+         LDX #$00
+         CMP #$0A
+         BCC L_70E2
+         INX
+L_70D8
+         SEC
+         SBC #$0A
+         CMP #$0A
+         BCC L_70E2
+         INX
+         BNE L_70D8
+L_70E2
+         STA ONES_DIGIT
+         STX TENS_DIGIT
+         CLC
+         RTS
+SCREEN_SAVE
+         CLC                            ; Save 8x5 block of HGR screen to $0700 buffer
+         LDX DISPLAY_POS
+         STX $7064
+         LDY $70CD
+         STY $7063
+         LDX #$00
+         LDA #$08
+         STA SCREEN_BLK_VARS
+L_70FE
+         LDA #$05
+         STA $7161
+         STX $7164
+         JSR HGR_LINE_SETUP
+         LDY $7068
+         LDX $7164
+L_710F
+         CLC
+         LDA ($02),Y
+         STA $0700,X
+         INX
+         INY
+         DEC $7161
+         BNE L_710F
+         INC $7063
+         DEC SCREEN_BLK_VARS
+         BNE L_70FE
+         RTS
+SCREEN_RESTORE
+         CLC                            ; Restore 8x5 block of HGR screen from $0700 buffer
+         LDX DISPLAY_POS
+         STX $7064
+         LDX $70CD
+         STX $7063
+         LDX #$00
+         LDA #$08
+         STA SCREEN_BLK_VARS
+L_7139
+         LDA #$05
+         STX $7164
+         STA $7161
+         JSR HGR_LINE_SETUP
+         LDY $7068
+         LDX $7164
+L_714A
+         CLC
+         LDA $0700,X
+         STA ($02),Y
+         INX
+         INY
+         DEC $7161
+         BNE L_714A
+         INC $7063
+         DEC SCREEN_BLK_VARS
+         BNE L_7139
+         RTS
+SCREEN_BLK_VARS
+         HEX 0000
+TENS_DIGIT
+         HEX 01
+ONES_DIGIT
+         HEX 0823
+
+;--------------------------------------
+; ===== SCORE/NUMBER DISPLAY ENGINE =====
+;--------------------------------------
+DRAW_NUMBER
+         CLC
+         STX $7064
+         STX DISPLAY_POS
+         STY $7063
+         STY $70CD
+         JSR SPLIT_DIGITS
+         JSR SCREEN_SAVE
+         LDX DISPLAY_POS
+         STX $7064
+         LDY $70CD
+         STY $7063
+         JSR HGR_LINE_SETUP
+         LDA TENS_DIGIT
+         BNE L_718E
+         LDA #$0A
+L_718E
+         CLC
+         JSR DRAW_CHAR
+         LDA ONES_DIGIT
+         JSR DRAW_CHAR
+         LDA #$00
+         JSR DRAW_CHAR
+         LDA #$00
+         JSR DRAW_CHAR
+         JSR SFX_SCORE
+         JSR SCREEN_RESTORE
+         JSR ADD_SCORE
+         JSR DRAW_SCORE
+         JSR CHECK_EXTRA_LIFE
+         JSR CHECK_HISCORE
+         RTS
+DRAW_CHAR
+         CLC                            ; Draw single font character glyph from $7003 table
+         ASL
+         ASL
+         ASL
+         STA FONT_DRAW_TMP
+         LDX $70CD
+         STX $7063
+         JSR HGR_CALC_ADDR
+         LDX #$08
+         STX $70CF
+         LDY $7068
+L_71CD
+         CLC
+         LDX FONT_DRAW_TMP
+         LDA $7003,X
+         STA ($02),Y
+         INC FONT_DRAW_TMP
+         INC $7063
+         JSR HGR_CALC_ADDR
+         DEC $70CF
+         BNE L_71CD
+         INC $7068
+         RTS
+
+;--------------------------------------
+; ===== SOUND EFFECTS =====
+; Rising-falling speaker tone (score change)
+;--------------------------------------
+SFX_SCORE
+         LDA #$40
+         STA $00
+         LDA #$80
+         STA $01
+         LDY $00
+L_71F2
+         LDX $01
+L_71F4
+         DEX
+         BNE L_71F4
+         LDA $C030                      ; toggle speaker
+         DEC $01
+         DEY
+         BNE L_71F2
+         LDY $00
+L_7201
+         LDX $01
+L_7203
+         DEX
+         BNE L_7203
+         LDA $C030                      ; toggle speaker
+         INC $01
+         DEY
+         BNE L_7201
+         RTS
+SFX_EXTRA_LIFE
+         LDA #$20                       ; Sustained buzz (extra life earned)
+         STA $00
+         STA $01
+         LDA #$80
+         STA $02
+L_7219
+         LDY $01
+L_721B
+         LDX $00
+L_721D
+         DEX
+         BNE L_721D
+         LDA $C030                      ; toggle speaker
+         DEY
+         BNE L_721B
+         DEC $02
+         BNE L_7219
+         RTS
+         HEX 040200
+LIVES_COUNT
+         HEX 03
+
+;--------------------------------------
+; ===== SCORE & STATUS DISPLAY =====
+; Draw remaining lives count
+;--------------------------------------
+DRAW_LIVES
+         CLC
+         LDA #$B8
+         STA $7063
+         LDA #$00
+         STA $7064
+         JSR HGR_LINE_SETUP
+         LDA LIVES_COUNT
+         STA $722B
+         LDA #$04
+         STA $722C
+L_7248
+         LDA #$B8
+         STA $70CD
+         LDA $722B
+         BEQ L_7259
+         DEC $722B
+         LDA #$0B
+         BNE L_725B
+L_7259
+         LDA #$0A
+L_725B
+         JSR DRAW_CHAR
+         DEC $722C
+         BNE L_7248
+         RTS
+DRAW_SCORE
+         CLC                            ; Draw 6-digit current score ($70BB-$70C0)
+         LDA #$20
+         STA $7064
+         LDA #$B8
+         STA $70CD
+         STA $7063
+         JSR HGR_LINE_SETUP
+         LDY #$00
+         STY $722C
+         STY $722B
+L_727D
+         CLC
+         LDY $722B
+         LDA SCORE_DIGITS,Y
+         BNE L_728F
+         LDY $722C
+         BNE L_7292
+         LDA #$0A
+         BNE L_7292
+L_728F
+         STA $722C
+L_7292
+         JSR DRAW_CHAR
+         INC $722B
+         LDA #$06
+         CMP $722B
+         BNE L_727D
+         RTS
+ADD_SCORE
+         LDA ONES_DIGIT                 ; Add ones/tens digits to score with BCD carry
+         CLC
+         ADC $70BE
+         STA $70BE
+         CLC
+         LDA TENS_DIGIT
+         ADC $70BD
+         STA $70BD
+         LDY #$05
+L_72B6
+         CLC
+         DEC $722B
+         BMI L_72DE
+         LDY $722B
+         LDA SCORE_DIGITS,Y
+         CMP #$0A
+         BCC L_72B6
+         SBC #$0A
+         CLC
+         LDY $722B
+         STA SCORE_DIGITS,Y
+         DEY
+         BMI L_72DE
+         LDA SCORE_DIGITS,Y
+         ADC #$01
+         CLC
+         STA SCORE_DIGITS,Y
+         JMP L_72B6
+L_72DE
+         RTS
+DRAW_BONUS
+         CLC                            ; Draw 4-digit bonus countdown timer
+         LDA #$51
+         STA $7064
+         LDA #$B8
+         STA $70CD
+         STA $7063
+         JSR HGR_LINE_SETUP
+         LDY #$00
+         STY $722C
+         STY $722B
+L_72F8
+         CLC
+         LDY $722B
+         LDA BONUS_DIGITS,Y
+         BNE L_730A
+         LDY $722C
+         BNE L_730D
+         LDA #$0A
+         BNE L_730D
+L_730A
+         STA $722C
+L_730D
+         JSR DRAW_CHAR
+         INC $722B
+         LDA #$04
+         CMP $722B
+         BNE L_72F8
+         RTS
+BONUS_TICK_CTR
+         HEX 1A
+TICK_BONUS
+         CLC                            ; Decrement bonus timer every 32 frames
+         INC BONUS_TICK_CTR
+         LDA #$20
+         CMP BONUS_TICK_CTR
+         BCC L_7328
+         RTS
+L_7328
+         CLC
+         LDA #$00
+         STA BONUS_TICK_CTR
+         LDY #$03
+         STY $722B
+         CLC
+         DEY
+         BMI L_735F
+         LDA BONUS_DIGITS,Y
+         CMP BONUS_PENALTY
+         BCC L_7348
+         SEC
+         SBC BONUS_PENALTY
+         CLC
+         STA BONUS_DIGITS,Y
+         RTS
+L_7348
+         CLC
+         SEC
+         LDA #$0A
+         SBC BONUS_PENALTY
+         CLC
+         STA BONUS_DIGITS,Y
+         DEY
+         LDA BONUS_DIGITS,Y
+         TAX
+         DEX
+         BMI L_7360
+         TXA
+         STA BONUS_DIGITS,Y
+L_735F
+         RTS
+L_7360
+         LDA #$09
+         STA BONUS_DIGITS,Y
+         DEY
+         LDA BONUS_DIGITS,Y
+         TAX
+         DEX
+         BMI L_7372
+         TXA
+         STA BONUS_DIGITS,Y
+         RTS
+L_7372
+         LDY #$00
+         LDA #$00
+         CLC
+L_7377
+         STA BONUS_DIGITS,Y
+         INY
+         CPY #$04
+         BNE L_7377
+         RTS
+         JSR TICK_BONUS
+         JSR DRAW_BONUS
+         RTS
+DRAW_HISCORE
+         CLC                            ; Draw 6-digit high score ($70C1-$70C6)
+         LDA #$78
+         STA $7064
+         LDA #$B8
+         STA $70CD
+         STA $7063
+         JSR HGR_LINE_SETUP
+         LDY #$00
+         STY $722C
+         STY $722B
+L_73A0
+         CLC
+         LDY $722B
+         LDA HISCORE_DIGITS,Y
+         BNE L_73B2
+         LDY $722C
+         BNE L_73B5
+         LDA #$0A
+         BNE L_73B5
+L_73B2
+         STA $722C
+L_73B5
+         JSR DRAW_CHAR
+         INC $722B
+         LDA #$06
+         CMP $722B
+         BNE L_73A0
+         RTS
+BONUS_TO_SCORE
+         CLC                            ; Transfer remaining bonus to score at level end
+         LDY #$00
+L_73C6
+         CLC
+         LDA BONUS_DIGITS,Y
+         ADC $70BD,Y
+         STA $70BD,Y
+         INY
+         CPY #$03
+         BNE L_73C6
+         CLC
+         LDY #$06
+L_73D8
+         CLC
+         DEY
+         BMI L_73F9
+         LDA SCORE_DIGITS,Y
+         CMP #$0A
+         BCC L_73D8
+         SBC #$0A
+         CLC
+         STA SCORE_DIGITS,Y
+         DEY
+         BMI L_73F9
+         LDA SCORE_DIGITS,Y
+         CLC
+         ADC #$01
+         STA SCORE_DIGITS,Y
+         INY
+         JMP L_73D8
+L_73F9
+         JSR DRAW_HISCORE
+         RTS
+CLEAR_STATUS_BAR
+         CLC                            ; Clear 8-row status bar area at bottom
+         LDA #$B8
+         STA $7063
+         LDA #$0A
+         STA $741A
+         LDA #$00
+         STA $7419
+         LDA #$08
+         STA $722B
+         JSR HGR_CALC_ADDR
+L_7415
+         CLC
+         LDY #$00
+L_7418
+         LDA $0C00
+         STA ($02),Y
+         INY
+         INC $7419
+         BNE L_7426
+         INC $741A
+L_7426
+         CPY #$40
+         BNE L_7418
+         INC $7063
+         JSR HGR_CALC_ADDR
+         DEC $722B
+         BNE L_7415
+         RTS
+CHECK_HISCORE
+         CLC                            ; Compare current score vs high score, update if higher
+         LDY #$00
+L_7439
+         CLC
+         LDA HISCORE_DIGITS,Y
+         CMP SCORE_DIGITS,Y
+         BCC L_7451
+         CLC
+         BNE L_744C
+         INY
+         CPY #$05
+         BEQ L_744C
+         BNE L_7439
+L_744C
+         CLC
+         JSR DRAW_HISCORE
+         RTS
+L_7451
+         CLC
+         LDY #$00
+L_7454
+         CLC
+         LDA SCORE_DIGITS,Y
+         STA HISCORE_DIGITS,Y
+         INY
+         CPY #$05
+         BNE L_7454
+         JSR DRAW_HISCORE
+         RTS
+CURRENT_LEVEL
+         HEX 01
+
+;--------------------------------------
+; ===== GAME INITIALIZATION =====
+; Zero score, set 3 lives, level 1, start game
+;--------------------------------------
+GAME_INIT
+         CLC
+         CLC
+         LDA #$00
+         STA SCORE_DIGITS
+         STA $70BC
+         STA $70BD
+         STA $70BE
+         STA $70BF
+         STA $7655
+         LDA #$01
+         STA CURRENT_LEVEL
+         LDA #$03
+         STA LIVES_COUNT
+L_7485
+         LDA #$01
+         STA PLAYER_ACTION
+         LDA #$A0
+         STA $103B
+         STA PLAYER_Y
+         LDA #$00
+         STA PLAYER_LAST_DIR
+         LDA #$44
+         STA PLAYER_X
+         LDA CURRENT_LEVEL
+         JMP L_9300
+L_74A2
+         ADC #$02
+         STA BONUS_DIGITS
+         LDA #$00
+         STA $70C9
+         STA $70CA
+         CLC
+         JSR CLEAR_SCREEN
+         JSR DRAW_FLOORS
+         JSR DRAW_STATUS_BORDER
+         JSR CLEAR_STATUS_BAR
+         JSR SELECT_BG_PATTERN
+         JSR CHECK_HISCORE
+         JSR DRAW_SCORE
+         JSR DRAW_BONUS
+         JSR DRAW_HISCORE
+         JSR DRAW_PLATFORMS
+         JSR COPY_HGR_PAGES
+         JSR DRAW_TIMER_BAR
+         JSR CLEAR_HOLES
+         JSR CLEAR_ENEMY_STATE
+         JSR LEVEL_SETUP
+         JSR DRAW_LIVES
+         JSR DRAW_ALL_ENEMIES
+         JSR SHOW_LIVES_SFX
+         LDA $C010                      ; clear keyboard strobe
+L_74E9
+         CLC
+         JMP $0400
+         JMP $0403
+         JMP $0406
+         JMP $0409
+         JMP $040C
+         JMP $040F
+         JMP $0412
+         JMP $0415
+         JMP $0418
+         JMP $041B
+         JMP $041E
+         JMP $0421
+         JMP $0424
+         JMP $0427
+         JMP $042A
+         JMP $042D
+         LDA HOURGLASS_TIMER
+         CMP #$1E
+         BCS L_7539
+         CMP #$14
+         BCS L_7536
+         CMP #$0A
+         BCS L_7533
+         CMP #$00
+         BNE L_7530
+         JMP L_7656
+L_7530
+         JSR ENEMY_UPDATE
+L_7533
+         JSR ENEMY_UPDATE
+L_7536
+         JSR ENEMY_UPDATE
+L_7539
+         JMP L_74E9
+         HEX 60
+         ORA ($00,X)
+         ORA ($00,X)
+         ORA ($00,X)
+         ORA ($00,X)
+         ORA ($00,X)
+         BRK
+         ORA ($00,X)
+         ORA ($00,X)
+         ORA ($00,X)
+         ORA ($00,X)
+         ORA ($46,X)
+
+;--------------------------------------
+; ===== LEVEL SETUP =====
+; Select background pattern based on level
+;--------------------------------------
+SELECT_BG_PATTERN
+         CLC
+         LDA LIVES_COUNT
+         INC BG_PAT_INDEX
+         ADC BG_PAT_INDEX
+         CLC
+         AND #$03
+         ASL
+         ASL
+         ASL
+         ASL
+         STA $722B
+         ASL
+         CLC
+         ADC $722B
+         TAY
+         LDX #$00
+L_756E
+         CLC
+         LDA $0C00,Y
+         STA LEVEL_MAP_TBL,X
+         INY
+         INX
+         CPX #$30
+         BNE L_756E
+         RTS
+CLEAR_ENEMY_STATE
+         CLC                            ; Clear all enemy state slots (110 bytes)
+         LDY #$00
+         TYA
+L_7580
+         CLC
+         STA ENEMY_ACTIVE,Y
+         INY
+         CPY #$6E
+         BNE L_7580
+         RTS
+LEVEL_SETUP_CTR
+         HEX 00
+LEVEL_SETUP
+         CLC                            ; Initialize enemy positions, ladders for current level
+         LDY #$00
+L_758E
+         CLC
+         LDA $753D,Y
+         STA ENEMY_CUR_FRAME,Y
+         INY
+         CPY #$14
+         BNE L_758E
+         LDA #$08
+         STA LEVEL_SETUP_CTR
+         LDY CURRENT_LEVEL
+         DEY
+         TYA
+         LDX #$00
+L_75A6
+         CMP #$03
+         BCC L_75B0
+         SBC #$03
+         INX
+         JMP L_75A6
+L_75B0
+         CLC
+         TAY
+         CLC
+         LDA ENEMY_COUNT_TBL,Y
+         TAY
+         DEY
+L_75B8
+         CLC
+         LDA #$01
+         STA ENEMY_ACTIVE,Y
+         DEY
+         BPL L_75B8
+         TXA
+         ASL
+         ASL
+         ASL
+         CLC
+         TAX
+         LDY #$00
+         STY $722B
+         LDA #$08
+         STA LEVEL_SETUP_CTR
+L_75D1
+         LDA ENEMY_TYPE_TBL,X
+         CLC
+         LDY $722B
+         STA ENEMY_TYPE,Y
+         TAY
+         LDA $7617,Y
+         LDY $722B
+         STA ENEMY_SPR_HI_T,Y
+         INC $722B
+         INX
+         DEC LEVEL_SETUP_CTR
+         BNE L_75D1
+         CLC
+         LDA CURRENT_LEVEL
+         INC BG_PAT_INDEX
+         ADC BG_PAT_INDEX
+         CLC
+         AND #$03
+         ASL
+         ASL
+         ASL
+         ASL
+         TAY
+         LDX #$00
+L_7602
+         CLC
+         LDA $0E00,Y
+         STA ENEMY_X_POS,X
+         INY
+         LDA $0E00,Y
+         STA ENEMY_Y_POS,X
+         INY
+         INX
+         CPX #$08
+         BNE L_7602
+         RTS
+         BPL L_762B
+         HEX 14
+ENEMY_COUNT_TBL
+         HEX 03
+         ORA $08
+         CLC
+         LDY #$00
+L_7620
+         CLC
+         LDA ENEMY_ACTIVE,Y
+         INY
+         CPY #$09
+         BEQ L_762E
+         CMP #$00
+L_762B
+         BEQ L_7620
+         RTS
+L_762E
+         CLC
+         JSR BONUS_TO_SCORE
+         JSR DRAW_SCORE
+         INC CURRENT_LEVEL
+         JMP L_930D
+CHECK_EXTRA_LIFE
+         CLC                            ; Award extra life when score threshold reached
+         LDA $7655
+         BEQ L_7642
+         RTS
+L_7642
+         LDA #$03
+         CMP $70BD
+         BCC L_764A
+         RTS
+L_764A
+         CLC
+         STA $7655
+         INC LIVES_COUNT
+         JSR SFX_EXTRA_LIFE
+         RTS
+         HEX 00
+L_7656
+         CLC
+L_7657
+         JSR SFX_SCORE
+         JSR SFX_SCORE
+         JSR SFX_SCORE
+         JSR SFX_SCORE
+         JSR SFX_SCORE
+         JSR CHECK_HISCORE
+         JSR DRAW_HISCORE
+         DEC LIVES_COUNT
+         LDA LIVES_COUNT
+         BEQ L_767F
+         BMI L_767F
+         JSR DELAY_LOOP
+         JSR DELAY_LOOP
+         JMP L_7485
+L_767F
+         CLC
+         CLC
+         LDA $C010                      ; clear keyboard strobe
+L_7684
+         LDA $C000                      ; read keyboard
+         CMP #$D3
+         BNE L_7684
+         JMP GAME_INIT
+SHOW_LIVES_SFX
+         CLC                            ; Flash lives display with sound effect
+         DEC LIVES_COUNT
+         JSR DRAW_PLAYER
+         JSR SFX_EXTRA_LIFE
+         JSR DRAW_LIVES
+         INC LIVES_COUNT
+         RTS
+DELAY_LOOP
+         CLC                            ; CPU burn delay loop
+         LDA #$08
+L_76A2
+         LDY #$00
+L_76A4
+         LDX #$00
+L_76A6
+         DEX
+         BNE L_76A6
+         DEY
+         BNE L_76A4
+         TAY
+         DEY
+         TYA
+         BNE L_76A2
+         RTS
+         HEX 0000
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+         ROR $007E,X
+         BRK
+ENEMY_TYPE_TBL
+         DS   8,$00                     ; zeroed
+         ORA ($00,X)
+         BRK
+         HEX 000000000002
+         ORA ($00,X)
+         BRK
+         HEX 0000000002
+         ORA ($01,X)
+         BRK
+         HEX 0000000002
+         ORA ($01,X)
+         ORA ($00,X)
+         BRK
+         HEX 000002
+         ORA ($01,X)
+         ORA ($01,X)
+         BRK
+         HEX 000002
+         ORA ($01,X)
+         ORA ($01,X)
+         ORA ($00,X)
+         BRK
+         HEX 02
+         ORA ($01,X)
+         ORA ($01,X)
+         ORA ($01,X)
+         BRK
+         HEX 02
+         ORA ($01,X)
+         ORA ($01,X)
+         ORA ($01,X)
+         ORA ($02,X)
+         HEX 02
+         ORA ($01,X)
+         ORA ($01,X)
+         ORA ($01,X)
+         HEX 020202
+         ORA ($01,X)
+         ORA ($01,X)
+         ORA ($02,X)
+         HEX 020202
+         ORA ($01,X)
+         ORA ($01,X)
+         HEX 0202020202
+         ORA ($01,X)
+         ORA ($02,X)
+         HEX 02020202020101020202020202020102
+         HEX 02020202020202
+         JMP L_7DE5
+HOLE_X_TABLE
+         DS   256,$00                   ; zeroed
+         HEX DB
+HOLE_DEPTH_TBL
+         DS   256,$00                   ; zeroed
+         DEC $44B0
+         HEX 8F4A0313
+         JSR SUB_A040
+PLAYER_X
+         HEX 44
+PLAYER_LAST_DIR
+         HEX 00
+PLAYER_ACTION
+         ORA ($00,X)
+KEY_CODE_TABLE
+         BRK
+         HEX 4B
+         LSR
+         EOR #$4D
+         EOR ($41,X)
+         HEX 5353
+BOUNDARY_RIGHT
+         HEX 83
+BOUNDARY_LEFT
+         HEX 00
+         LDY #$00
+         BPL L_7A21
+L_7A21
+         ORA ($00,X)
+         ADC #$00
+         JMP ($6A80)
+         HEX 80
+         ADC $6000
+         BRK
+         HEX 6300
+         ROR $80
+         ADC ($80,X)
+         HEX 648067000800080008
+
+;--------------------------------------
+; ===== ALTERNATE HGR CALC (FOR SPRITES) =====
+;--------------------------------------
+HGR_CALC_ADDR_ALT
+         LDA SPRITE_Y_ROW
+         PHA
+         AND #$C0
+         STA $02
+         LSR
+         LSR
+         ORA $02
+         STA $02
+         PLA
+         STA $03
+         ASL
+         ASL
+         ASL
+         ROL $03
+         ASL
+         ROL $03
+         ASL
+         ROR $02
+         LDA $02
+         STA $04
+         LDA $03
+         AND #$1F
+         PHA
+         ORA $7A0B
+         STA $03
+         PLA
+         ORA $7A0C
+         STA $05
+         RTS
+SPRITE_POS_SETUP
+         JSR HGR_CALC_ADDR_ALT
+         LDY #$00
+         LDA SPRITE_X_COL
+         ASL
+         BCC L_7A7E
+         CLC
+         LDY #$23
+         ADC #$04
+L_7A7D
+         INY
+L_7A7E
+         SBC #$07
+         BCS L_7A7D
+         STY $7A0A
+         ADC #$08
+         CLC
+         STA $7A09
+         RTS
+
+;--------------------------------------
+; ===== INPUT HANDLING =====
+; Read keyboard, match against IJKM/DUEX key table
+;--------------------------------------
+READ_KEYBOARD
+         CLC
+         LDA $C000                      ; read keyboard
+         AND #$7F
+         LDY #$08
+L_7A94
+         CLC
+         CMP KEY_CODE_TABLE,Y
+         BEQ L_7A9D
+         DEY
+         BNE L_7A94
+L_7A9D
+         CPY #$04
+         BEQ L_7AA3
+         BCS L_7AA5
+L_7AA3
+         CLC
+         RTS
+L_7AA5
+         LDA PLAYER_ACTION
+         AND #$01
+         STA L_7A21
+         CLC
+         TYA
+         ORA L_7A21
+         TAY
+         RTS
+
+;--------------------------------------
+; ===== PLAYER MOVEMENT CONTROLLER =====
+; Master: reads input, validates against platforms/ladders,
+; handles falling, digging, stomping
+;--------------------------------------
+PLAYER_MOVE
+         LDA PLR_ON_GROUND
+         BNE L_7ABC
+         JMP L_8044
+L_7ABC
+         JSR READ_KEYBOARD
+         LDA #$FF
+         STA PLR_MOVING
+L_7AC4
+         CLC
+         CPY #$00
+         BNE L_7AD0
+         STY PLAYER_LAST_DIR
+         STY PLR_MOVING
+         RTS
+L_7AD0
+         CPY #$01
+         BNE L_7B05
+         LDA PLAYER_Y
+         AND #$1F
+         BEQ L_7AE1
+         LDY PLAYER_ACTION
+         JMP L_7AC4
+L_7AE1
+         JSR CHECK_LADDER
+         CMP #$05
+         BNE L_7AEB
+         JMP L_803E
+L_7AEB
+         LDY #$01
+         CMP #$00
+         BNE L_7AFE
+         LDX PLAYER_X
+         INX
+         CPX BOUNDARY_RIGHT
+         BCS L_7AFE
+         STX PLAYER_X
+         RTS
+L_7AFE
+         CLC
+         LDA #$00
+         STA PLR_MOVING
+         RTS
+L_7B05
+         CPY #$02
+         BNE L_7B34
+         LDA PLAYER_Y
+         AND #$1F
+         BEQ L_7B16
+         LDY PLAYER_ACTION
+         JMP L_7AC4
+L_7B16
+         JSR CHECK_LADDER
+         CMP #$05
+         BNE L_7B20
+         JMP L_803E
+L_7B20
+         LDY #$02
+         CMP #$00
+         BNE L_7AFE
+         LDX PLAYER_X
+         DEX
+         CPX BOUNDARY_LEFT
+         BEQ L_7AFE
+         STX PLAYER_X
+         CLC
+         RTS
+L_7B34
+         CPY #$03
+         BNE L_7B5F
+         CLC
+         LDA PLAYER_Y
+         ADC #$0F
+         LDY PLAYER_X
+         JSR CHECK_PLATFORM
+         CMP #$00
+         BNE L_7B4E
+         LDY PLAYER_ACTION
+         JMP L_7AC4
+L_7B4E
+         LDY #$03
+         AND #$02
+         BEQ L_7AFE
+         LDX PLAYER_Y
+         DEX
+         DEX
+         STX PLAYER_Y
+         LDY #$03
+         RTS
+L_7B5F
+         CPY #$04
+         BNE L_7B8D
+         CLC
+         LDA PLAYER_Y
+         ADC #$0F
+         LDY PLAYER_X
+         JSR CHECK_PLATFORM
+         CMP #$00
+         BNE L_7B79
+         LDY PLAYER_ACTION
+         JMP L_7AC4
+L_7B79
+         LDY #$04
+         AND #$01
+         BNE L_7B82
+         JMP L_7AFE
+L_7B82
+         LDX PLAYER_Y
+         INX
+         INX
+         STX PLAYER_Y
+         LDY #$04
+         RTS
+L_7B8D
+         CLC
+         BCC L_7B95
+         BEQ L_7B95
+         JMP L_7AFE
+L_7B95
+         CPY #$06
+         BNE L_7BAD
+L_7B99
+         STY $7BD4
+         JSR VALIDATE_DIG
+         CMP #$00
+         BEQ L_7BAA
+         JSR DIG_ANIM
+         LDY $7BD4
+         RTS
+L_7BAA
+         JMP L_7AFE
+L_7BAD
+         CPY #$08
+         BNE L_7BC7
+L_7BB1
+         STY $7BD4
+         JSR VALIDATE_STOMP
+         CMP #$00
+         BNE L_7BC0
+         LDY #$00
+         JMP L_7AFE
+L_7BC0
+         JSR STOMP_ANIM
+         LDY $7BD4
+         RTS
+L_7BC7
+         CPY #$07
+         BNE L_7BCD
+         BEQ L_7B99
+L_7BCD
+         CPY #$09
+         BEQ L_7BB1
+         JMP L_7AFE
+         HEX 09
+
+;--------------------------------------
+; ===== SPRITE FRAME SELECTION =====
+; Walk right animation frames
+;--------------------------------------
+SPRITE_WALK_R
+         CLC
+         LDY $7A2A
+         LDX $7A2B
+         LDA PLAYER_X
+         LSR
+         BCC L_7BE8
+         LDY $7A30
+         LDX $7A31
+L_7BE8
+         STY $08
+         STX $09
+         RTS
+SPRITE_WALK_L
+         CLC                            ; Walk left animation frames
+         LDY $7A2C
+         LDX $7A2D
+         LDA PLAYER_X
+         LSR
+         BCC L_7C00
+         LDY $7A32
+         LDX $7A33
+L_7C00
+         STY $08
+         STX $09
+         RTS
+SPRITE_CLIMB
+         CLC                            ; Climbing animation frames
+         LDY $7A2E
+         LDX $7A2F
+         LDA PLAYER_Y
+         LSR
+         LSR
+         BCC L_7C19
+         LDY $7A34
+         LDX $7A35
+L_7C19
+         STY $08
+         STX $09
+         RTS
+SPRITE_DIG_L
+         CLC                            ; Digging left animation frames
+         LDY PLR_SPR_PTRS
+         LDX $7A23
+         LDA DIG_SPR_TOGGLE
+         BEQ L_7C30
+         LDY $7A26
+         LDX $7A27
+L_7C30
+         STY $08
+         STX $09
+         RTS
+SPRITE_DIG_R
+         CLC                            ; Digging right animation frames
+         LDY $7A24
+         LDX $7A25
+         LDA DIG_SPR_TOGGLE
+         BEQ L_7C47
+         LDY $7A28
+         LDX $7A29
+L_7C47
+         STY $08
+         STX $09
+         RTS
+SPRITE_STAND
+         CLC                            ; Standing/idle pose
+         LDY $7A2E
+         LDX $7A2F
+         LDA PLAYER_ACTION
+         LSR
+         BCC L_7C5F
+         LDY $7A34
+         LDX $7A35
+L_7C5F
+         STY $08
+         STX $09
+         RTS
+         HEX 00
+DIG_SPR_TOGGLE
+         HEX 00
+
+;--------------------------------------
+; ===== PLAYER SPRITE RENDERING =====
+; Draw player using XOR with page 2 background restore
+;--------------------------------------
+DRAW_PLAYER
+         CLC
+         JSR SPRITE_DISPATCH
+         LDA PLAYER_Y
+         LDY PLAYER_X
+         STA SPRITE_Y_ROW
+         STY SPRITE_X_COL
+         JSR SPRITE_POS_SETUP
+         LDA #$00
+         STA $06
+         STA $07
+         LDX $7A09
+L_7C82
+         CLC
+         BEQ L_7C94
+         LDA $06
+         ADC #$30
+         STA $06
+         LDA #$00
+         ADC $07
+         STA $07
+         DEX
+         BNE L_7C82
+L_7C94
+         CLC
+         LDA $06
+         ADC $08
+         STA $08
+         LDA $07
+         ADC $09
+         STA $09
+         CLC
+         LDA #$00
+         STA $7A1F
+L_7CA7
+         CLC
+         JSR HGR_CALC_ADDR_ALT
+         LDY #$00
+         LDA $02
+         CLC
+         ADC $7A0A
+         STA $02
+L_7CB5
+         CLC
+         LDA ($02),Y
+         LDX #$00
+         ORA ($08,X)
+         STA ($02),Y
+         LDA $08
+         ADC #$01
+         STA $08
+         LDA $09
+         ADC #$00
+         STA $09
+         INY
+         CPY #$03
+         BNE L_7CB5
+         INC SPRITE_Y_ROW
+         INC $7A1F
+         LDA $7A1F
+         CMP #$10
+         BNE L_7CA7
+         RTS
+CHECK_PLATFORM
+         CLC                            ; Test if position intersects platform or ladder
+; Returns: 0=air, 1=top, 2=bottom, 3=on-ladder
+         STA $7A07
+         STY $7A08
+         LDY #$FF
+L_7CE6
+         CLC
+         INY
+         LDA LEVEL_MAP_TBL,Y
+         BEQ L_7D16
+         CMP $7A08
+         BEQ L_7CF5
+         JMP L_7CE6
+L_7CF5
+         CLC
+         LDA $7A07
+         CMP $7E7E,Y
+         BEQ L_7D0E
+         BCC L_7CE6
+         CLC
+         LDA $7A07
+         CMP $7E8E,Y
+         BEQ L_7D12
+         BCS L_7CE6
+         LDA #$03
+         RTS
+L_7D0E
+         CLC
+         LDA #$01
+         RTS
+L_7D12
+         CLC
+         LDA #$02
+         RTS
+L_7D16
+         LDA #$00
+         RTS
+SPRITE_DISPATCH
+         LDA PLAYER_ACTION              ; Select sprite pointer routine based on action code
+         CMP #$01
+         BNE L_7D24
+         JSR SPRITE_WALK_R
+         RTS
+L_7D24
+         CMP #$02
+         BNE L_7D2C
+         JSR SPRITE_WALK_L
+         RTS
+L_7D2C
+         CMP #$03
+         BNE L_7D34
+         JSR SPRITE_CLIMB
+         RTS
+L_7D34
+         CMP #$04
+         BNE L_7D3C
+         JSR SPRITE_CLIMB
+         RTS
+L_7D3C
+         CMP #$07
+         BNE L_7D44
+         JSR SPRITE_DIG_L
+         RTS
+L_7D44
+         CMP #$06
+         BNE L_7D4C
+         JSR SPRITE_DIG_R
+         RTS
+L_7D4C
+         CMP #$09
+         BNE L_7D54
+         JSR SPRITE_DIG_L
+         RTS
+L_7D54
+         CMP #$08
+         BNE L_7D5C
+         JSR SPRITE_DIG_R
+         RTS
+L_7D5C
+         JSR SPRITE_STAND
+         RTS
+ERASE_PLAYER
+         CLC                            ; Erase player sprite via XOR
+         JSR SPRITE_DISPATCH
+         LDA PLAYER_Y
+         LDY PLAYER_X
+         STA SPRITE_Y_ROW
+         STY SPRITE_X_COL
+         JSR SPRITE_POS_SETUP
+         LDA #$00
+         STA $06
+         STA $07
+         LDX $7A09
+         BEQ L_7D8E
+L_7D7E
+         CLC
+         LDA $06
+         ADC #$30
+         STA $06
+         LDA #$00
+         ADC $07
+         STA $07
+         DEX
+         BNE L_7D7E
+L_7D8E
+         CLC
+         LDA $06
+         ADC $08
+         STA $08
+         LDA $07
+         ADC $09
+         STA $09
+         CLC
+         LDA #$00
+         STA $7A1F
+L_7DA1
+         CLC
+         JSR HGR_CALC_ADDR_ALT
+         LDY #$00
+         LDA $02
+         ADC $7A0A
+         STA $02
+         LDA $04
+         CLC
+         ADC $7A0A
+         STA $04
+L_7DB6
+         CLC
+         LDA ($02),Y
+         LDX #$00
+         EOR ($08,X)
+         LDX PLR_ON_GROUND
+         BEQ L_7DC4
+         ORA ($04),Y
+L_7DC4
+         STA ($02),Y
+         LDA $08
+         ADC #$01
+         STA $08
+         LDA $09
+         ADC #$00
+         STA $09
+         INY
+         CPY #$03
+         BNE L_7DB6
+         INC SPRITE_Y_ROW
+         INC $7A1F
+         LDA $7A1F
+         CMP #$10
+         BNE L_7DA1
+         RTS
+L_7DE5
+         JSR CLEAR_SCREEN
+         JSR DRAW_FLOORS
+         JSR DRAW_STATUS_BORDER
+         JSR DRAW_PLATFORMS
+         JSR COPY_HGR_PAGES
+         JSR DRAW_TIMER_BAR
+         JSR CLEAR_HOLES
+         JMP L_8A38
+UPDATE_PLAYER
+         JSR MOVE_AND_DRAW              ; Full player frame: erase, move, redraw, delay
+         JSR TICK_TIMER_BAR
+         LDA #$20
+         JSR GAME_DELAY
+         RTS
+MOVE_AND_DRAW
+         CLC                            ; Erase sprite, read input, move, redraw
+         JSR ERASE_PLAYER
+         JSR PLAYER_MOVE
+         TYA
+         BEQ L_7E16
+         STA PLAYER_ACTION
+L_7E16
+         STA PLAYER_LAST_DIR
+         JSR DRAW_PLAYER
+         RTS
+
+;--------------------------------------
+; ===== GRAPHICS ENGINE =====
+; Copy HGR page 1 to page 2 (background snapshot)
+;--------------------------------------
+COPY_HGR_PAGES
+         LDA #$20
+         STA $03
+         LDA #$40
+         STA $05
+         LDA #$00
+         STA $02
+         STA $04
+         LDY #$00
+L_7E2D
+         CLC
+         LDA ($02),Y
+         STA ($04),Y
+         INY
+         BNE L_7E2D
+         INC $03
+         INC $05
+         LDA $03
+         CMP #$40
+         BNE L_7E2D
+         RTS
+DRAW_STATUS_BORDER
+         CLC                            ; Draw decorative border at rows $B0-$B1
+         LDA #$B0
+         STA SPRITE_Y_ROW
+         JSR HGR_CALC_ADDR_ALT
+         LDY #$27
+L_7E4B
+         LDA #$D5
+         STA ($02),Y
+         DEY
+         LDA #$AA
+         STA ($02),Y
+         DEY
+         BPL L_7E4B
+         LDA #$B1
+         STA SPRITE_Y_ROW
+         JSR HGR_CALC_ADDR_ALT
+         LDY #$27
+L_7E61
+         LDA #$D5
+         STA ($02),Y
+         DEY
+         LDA #$AA
+         STA ($02),Y
+         DEY
+         BPL L_7E61
+         RTS
+LEVEL_MAP_TBL
+         HEX 04
+         CLC
+         JSR $3028
+         BVC L_7EC5
+         HEX 6480000000000000000F0F8F4F0F2F8F
+         HEX 2F0F00000000000000AF2FAF8F4F4FAF
+         HEX 6FAF00000000000000
+CLEAR_SCREEN
+         CLC                            ; Clear HGR screen and set graphics mode
+         LDA #$20
+         STA $03
+         LDA #$00
+         STA $02
+L_7EA7
+         LDY #$00
+L_7EA9
+         CLC
+         STA ($02),Y
+         INY
+         BNE L_7EA9
+         INC $03
+         LDX $03
+         CPX #$60
+         BNE L_7EA7
+         LDA $C050                      ; set graphics mode
+         LDA $C057                      ; set hi-res
+         LDA $C054                      ; select page 1
+         LDA $C052                      ; set full screen
+         RTS
+DRAW_PLATFORMS
+         CLC                            ; Draw all platforms and ladders from level map
+L_7EC5
+         LDY #$00
+         STY L_7EDF
+L_7ECA
+         CLC
+         LDA LEVEL_MAP_TBL,Y
+         BEQ L_7EDC
+         JSR SUB_7EE0
+         INC L_7EDF
+         LDY L_7EDF
+         JMP L_7ECA
+L_7EDC
+         RTS
+         BPL L_7EDF
+L_7EDF
+         ORA #$8D
+         ASL $7A
+         LDA $7E7E,Y
+         SEC
+         SBC #$0A
+         CLC
+         STA SPRITE_Y_ROW
+         JSR SPRITE_POS_SETUP
+         CLC
+         LDA $7A09
+         ASL
+         ASL
+         STA $7EDD
+         JSR DRAW_PLAT_TOP
+         JSR DRAW_PLAT_TOP
+L_7EFF
+         CLC
+         JSR DRAW_PLAT_BOT
+         JSR DRAW_PLAT_BOT
+         JSR DRAW_PLAT_TOP
+         JSR DRAW_PLAT_TOP
+         CLC
+         LDY L_7EDF
+         LDA $7E8E,Y
+         CMP SPRITE_Y_ROW
+         BNE L_7EFF
+         RTS
+DRAW_PLAT_TOP
+         CLC                            ; Draw platform segment top half
+         INC SPRITE_Y_ROW
+         JSR HGR_CALC_ADDR_ALT
+         LDA #$03
+         STA $7EDE
+         LDY $7A0A
+         LDX $7EDD
+L_7F2B
+         CLC
+         LDA $6F00,X
+         AND ($02),Y
+         ORA $6F40,X
+         STA ($02),Y
+         INY
+         INX
+         DEC $7EDE
+         BNE L_7F2B
+         RTS
+DRAW_PLAT_BOT
+         CLC                            ; Draw platform segment bottom half
+         INC SPRITE_Y_ROW
+         JSR HGR_CALC_ADDR_ALT
+         LDA #$03
+         STA $7EDE
+         LDY $7A0A
+         LDX $7EDD
+L_7F50
+         CLC
+         LDA $6F00,X
+         AND ($02),Y
+         ORA $6F80,X
+         STA ($02),Y
+         INY
+         INX
+         DEC $7EDE
+         BNE L_7F50
+         RTS
+DRAW_FLOORS
+         LDX #$10                       ; Draw all 5 floor levels
+         JSR DRAW_FLOOR
+         LDX #$30
+         JSR DRAW_FLOOR
+         LDX #$50
+         JSR DRAW_FLOOR
+         LDX #$70
+         JSR DRAW_FLOOR
+         LDX #$90
+         JSR DRAW_FLOOR
+         RTS
+         HEX 9692
+DRAW_FLOOR
+         TXA                            ; Draw one floor: solid top + open interior with walls
+         CLC
+         ADC #$06
+         STA $7F7D
+         TXA
+         CLC
+         ADC #$02
+         STA $7F7E
+L_7F8D
+         STX SPRITE_Y_ROW
+         JSR HGR_CALC_ADDR_ALT
+         LDY #$00
+L_7F95
+         LDA #$2A
+         CLC
+         STA ($02),Y
+         INY
+         LDA #$54
+         CLC
+         STA ($02),Y
+         INY
+         CPY #$28
+         BNE L_7F95
+         INX
+         CPX $7F7E
+         BNE L_7F8D
+         INX
+L_7FAC
+         STX SPRITE_Y_ROW
+         JSR HGR_CALC_ADDR_ALT
+         LDY #$00
+L_7FB4
+         LDA #$2A
+         CLC
+         STA ($02),Y
+         INY
+         CPY #$27
+         BEQ L_7FC7
+         LDA #$15
+         CLC
+         STA ($02),Y
+         INY
+         JMP L_7FB4
+L_7FC7
+         LDA #$55
+         CLC
+         STA ($02),Y
+         INX
+         CPX $7F7D
+         BNE L_7FAC
+         RTS
+GAME_DELAY
+         STA $E0                        ; Adjustable delay with walking sound clicks
+         TAY
+         TAX
+L_7FD7
+         DEX
+         BNE L_7FD7
+         DEY
+         BNE L_7FD7
+         LDA PLR_MOVING
+         BNE L_7FE3
+         RTS
+L_7FE3
+         LDA $E1
+         BNE L_7FEB
+         INC $E1
+         BNE L_7FEF
+L_7FEB
+         LDA #$00
+         STA $E1
+L_7FEF
+         CLC
+         LDA PLAYER_LAST_DIR
+         ASL
+         ADC $E1
+         TAY
+         CLC
+         LDA $8008,Y
+         LDY #$28
+L_7FFD
+         TAX
+L_7FFE
+         DEX
+         BNE L_7FFE
+         STA $C030                      ; toggle speaker
+         DEY
+         BNE L_7FFD
+         RTS
+         JSR $2430
+         HEX 34
+         ROL $36
+         PLP
+         SEC
+         ROL
+         HEX 3A
+         BIT $2D3C
+         AND $3E2E,X
+         HEX 2F3F
+
+;--------------------------------------
+; ===== HOLE MANAGEMENT =====
+; Search hole table for hole at given position
+;--------------------------------------
+LOOKUP_HOLE
+         CLC
+         STA $7A07
+         STY $7A08
+         TAY
+         LDA $7A08
+         LDX #$0F
+         DEY
+L_8028
+         CLC
+         INY
+         DEX
+         BEQ L_8037
+         CMP HOLE_X_TABLE,Y
+         BNE L_8028
+         CLC
+         LDA HOLE_DEPTH_TBL,Y
+         RTS
+L_8037
+         CLC
+         LDA #$00
+         RTS
+PLR_ON_GROUND
+         HEX FF
+PLR_MOVING
+         HEX 00
+PLR_SAVED_DIR
+         HEX 02
+L_803E
+         LDA PLAYER_ACTION
+         STA PLR_SAVED_DIR
+L_8044
+         LDA PLAYER_Y
+         AND #$1F
+         BNE L_805E
+         LDA PLAYER_Y
+         CLC
+         ADC #$0F
+         LDY PLAYER_X
+         JSR LOOKUP_HOLE
+         CMP #$00
+         BNE L_8071
+         JMP L_8075
+L_805E
+         CLC
+         INC PLAYER_Y
+         INC PLAYER_Y
+         LDA #$00
+         STA PLR_MOVING
+         STA PLR_ON_GROUND
+         LDY #$05
+         NOP
+         RTS
+L_8071
+         CMP #$05
+         BEQ L_805E
+L_8075
+         LDA #$FF
+         STA PLR_ON_GROUND
+         LDA PLAYER_Y
+         CLC
+         ADC #$0F
+         TAY
+         LDA PLAYER_X
+         CLC
+         LDX #$0F
+         DEY
+L_8088
+         CLC
+         LDA PLAYER_X
+         INY
+         DEX
+         BEQ L_80BF
+         SEC
+         SBC HOLE_X_TABLE,Y
+         BPL L_809B
+         EOR #$FF
+         CLC
+         ADC #$01
+L_809B
+         CMP #$06
+         BCS L_8088
+         LDA HOLE_DEPTH_TBL,Y
+         CMP #$05
+         BEQ L_80BF
+         CMP #$00
+         BEQ L_80BF
+         LDA HOLE_X_TABLE,Y
+         CMP PLAYER_X
+         BCS L_80BA
+         ADC #$07
+         STA PLAYER_X
+         JMP L_80BF
+L_80BA
+         SBC #$07
+         STA PLAYER_X
+L_80BF
+         LDY PLR_SAVED_DIR
+         RTS
+CLEAR_HOLES
+         CLC                            ; Clear all hole tables
+         LDY #$00
+         TYA
+L_80C7
+         CLC
+         STA HOLE_X_TABLE,Y
+         STA HOLE_DEPTH_TBL,Y
+         INY
+         BNE L_80C7
+         RTS
+         HEX 60
+VALIDATE_DIG
+         LDA PLAYER_Y                   ; Validate dig action: must be on floor edge, target clear
+         AND #$1F
+         BNE L_80E0
+         LDA PLAYER_X
+         LSR
+         BCS L_80E6
+L_80E0
+         LDA #$00
+         LDY #$00
+         CLC
+         RTS
+L_80E6
+         LDA PLAYER_Y
+         CMP #$A0
+         BCS L_80E0
+         TYA
+         LSR
+         BCS L_80FA
+         SEC
+         LDA PLAYER_X
+         SBC #$07
+         JMP L_8100
+L_80FA
+         LDA PLAYER_X
+         CLC
+         ADC #$07
+L_8100
+         STA DIG_TARGET_COL
+         CMP BOUNDARY_LEFT
+         BEQ L_80E0
+         CMP BOUNDARY_RIGHT
+         BCS L_80E0
+         CLC
+         LDA PLAYER_Y
+         ADC #$0F
+         STA DIG_TARGET_ROW
+         LDY DIG_TARGET_COL
+         JSR LOOKUP_HOLE
+         CMP #$00
+         BEQ L_8127
+         AND #$7F
+         CMP #$05
+         BEQ L_80E0
+         RTS
+L_8127
+         LDY #$FF
+         LDX #$0F
+L_812B
+         INY
+         LDA LEVEL_MAP_TBL,Y
+         BEQ L_815B
+         DEX
+         BEQ L_815B
+         LDA DIG_TARGET_COL
+         SEC
+         SBC LEVEL_MAP_TBL,Y
+         BPL L_8142
+         EOR #$FF
+         CLC
+         ADC #$01
+L_8142
+         CMP #$09
+         BCS L_812B
+         LDA DIG_TARGET_ROW
+         CMP $7E7E,Y
+         BEQ L_80E0
+         BCC L_812B
+         CLC
+         CMP $7E8E,Y
+         BEQ L_80E0
+         BCS L_812B
+         CLC
+         BCC L_80E0
+L_815B
+         LDY DIG_TARGET_ROW
+         DEY
+         LDX #$0F
+L_8161
+         LDA DIG_TARGET_COL
+         INY
+         DEX
+         BEQ L_817C
+         SEC
+         SBC HOLE_X_TABLE,Y
+         BPL L_8173
+         EOR #$FF
+         CLC
+         ADC #$01
+L_8173
+         CMP #$09
+         BCS L_8161
+         LDA #$00
+         JMP L_80E0
+L_817C
+         LDA #$06
+         RTS
+VALIDATE_STOMP
+         LDA PLAYER_X                   ; Validate stomp: must be on floor edge with hole below
+         LSR
+         BCS L_8188
+         LDA #$00
+         RTS
+L_8188
+         LDA PLAYER_ACTION
+         LSR
+         BCS L_8197
+         LDA PLAYER_X
+         SEC
+         SBC #$07
+         JMP L_819D
+L_8197
+         LDA PLAYER_X
+         CLC
+         ADC #$07
+L_819D
+         TAY
+         LDA PLAYER_Y
+         CLC
+         ADC #$0F
+         JSR LOOKUP_HOLE
+         RTS
+         HEX 2C
+CHECK_LADDER
+         LDA PLAYER_X                   ; Check if player can step onto ladder
+         STA $81A8
+         LSR
+         BCS L_81B5
+         JMP L_81EB
+L_81B5
+         STY DIG_TARGET_ROW
+         CPY #$01
+         BNE L_81C5
+         CLC
+         LDA $81A8
+         ADC #$07
+         JMP L_81CB
+L_81C5
+         LDA $81A8
+         SEC
+         SBC #$07
+L_81CB
+         TAY
+         STY $81A8
+         LDA PLAYER_Y
+         CLC
+         ADC #$0F
+         JSR LOOKUP_HOLE
+         CMP #$05
+         BEQ L_8238
+         CMP #$00
+         BEQ L_81E8
+L_81E0
+         PLA
+         PLA
+         LDY PLAYER_ACTION
+         JMP L_7AFE
+L_81E8
+         LDA #$00
+         RTS
+L_81EB
+         LDA PLAYER_Y
+         CLC
+         ADC #$0F
+         LDY $81A8
+         JSR LOOKUP_HOLE
+         CMP #$05
+         BEQ L_8203
+         CMP #$00
+         BEQ L_8202
+         JMP L_81E0
+L_8202
+         RTS
+L_8203
+         CLC
+         LDA PLAYER_Y
+         ADC #$0F
+         STA DIG_TARGET_ROW
+         LDY $81A8
+         STY DIG_TARGET_COL
+L_8212
+         CLC
+         LDA DIG_TARGET_ROW
+         ADC #$20
+         CLC
+         STA DIG_TARGET_ROW
+         CMP #$AF
+         BCC L_8223
+         LDA #$05
+         RTS
+L_8223
+         LDY DIG_TARGET_COL
+         JSR LOOKUP_HOLE
+         CMP #$05
+         BEQ L_8212
+         CMP #$00
+         BNE L_8234
+         LDA #$05
+         RTS
+L_8234
+         JMP L_81E0
+         HEX 60
+L_8238
+         CLC
+         LDA PLAYER_Y
+         ADC #$0F
+         STA DIG_TARGET_ROW
+         LDY $81A8
+         STY DIG_TARGET_COL
+L_8247
+         CLC
+         LDA DIG_TARGET_ROW
+         ADC #$20
+         CLC
+         STA DIG_TARGET_ROW
+         CMP #$AF
+         BCC L_8258
+         LDA #$00
+         RTS
+L_8258
+         LDY DIG_TARGET_COL
+         JSR LOOKUP_HOLE
+         CMP #$05
+         BEQ L_8247
+         CMP #$00
+         BNE L_8269
+         LDA #$00
+         RTS
+L_8269
+         LDA #$01
+         RTS
+DIG_TARGET_ROW
+         HEX 02
+DIG_TARGET_COL
+         ASL $0200
+DIG_HOLE_SLOT
+         HEX 2F03
+DIG_ANIM
+         CLC                            ; Multi-frame digging animation controller
+         LDX #$00
+         STX PLR_MOVING
+         CMP #$06
+         BEQ L_8282
+         STY DIG_HOLE_SLOT
+         JMP L_8285
+L_8282
+         JSR FIND_HOLE_SLOT
+L_8285
+         INC DIG_ANIM_CTR
+         LDA DIG_ANIM_CTR
+         CMP $82BC
+         BNE L_8294
+         JSR CREATE_HOLE
+         RTS
+L_8294
+         CMP $82BD
+         BNE L_829D
+         JSR SFX_IMPACT
+         RTS
+L_829D
+         CMP $82BF
+         BNE L_82A8
+         LDA #$FF
+         STA DIG_SPR_TOGGLE
+         RTS
+L_82A8
+         CMP $82BE
+         BNE L_82AE
+         RTS
+L_82AE
+         CMP $82C0
+         BNE L_82BB
+         LDA #$00
+         STA DIG_ANIM_CTR
+         STA DIG_SPR_TOGGLE
+L_82BB
+         RTS
+         HEX 0204
+         ASL $08
+         ASL
+FIND_HOLE_SLOT
+         LDA PLAYER_Y                   ; Find empty slot in hole table
+         CLC
+         ADC #$0F
+         TAY
+         CLC
+         LDX #$0F
+         DEY
+L_82CC
+         CLC
+         INY
+         DEX
+         BEQ L_82D6
+         LDA HOLE_X_TABLE,Y
+         BNE L_82CC
+L_82D6
+         STY DIG_HOLE_SLOT
+         RTS
+CREATE_HOLE
+         CLC                            ; Place new hole in table and draw it
+         LDY DIG_HOLE_SLOT
+         LDA HOLE_X_TABLE,Y
+         BNE L_82F8
+         LDA PLAYER_ACTION
+         LSR
+         BCC L_82F2
+         CLC
+         LDA PLAYER_X
+         ADC #$07
+         JMP L_82F8
+L_82F2
+         SEC
+         LDA PLAYER_X
+         SBC #$07
+L_82F8
+         CLC
+         STA HOLE_X_TABLE,Y
+         LDX DIG_HOLE_SLOT
+         INC HOLE_DEPTH_TBL,X
+         STA SPRITE_X_COL
+         LDA PLAYER_Y
+         ADC #$10
+         STA SPRITE_Y_ROW
+         JSR DRAW_HOLE
+         RTS
+DRAW_HOLE
+         CLC                            ; Draw hole tile with depth-based frame
+         JSR SPRITE_POS_SETUP
+         LDA $7A3A
+         STA $06
+         LDA $7A3B
+         STA $07
+         LDA $7A09
+         ASL
+         ASL
+         ASL
+         ASL
+         STA $838A
+         ASL
+         CLC
+         ADC $838A
+         PHP
+         CLC
+         ADC $06
+         STA $06
+         PLP
+         LDA $07
+         ADC #$00
+         STA $07
+         LDY DIG_HOLE_SLOT
+         LDA HOLE_DEPTH_TBL,Y
+         AND #$0F
+         TAY
+         CLC
+         LDA HOLE_DEPTH_OFFS,Y
+         CLC
+         ADC $06
+         STA $06
+         LDA $07
+         ADC #$00
+         STA $07
+         CLC
+         LDA #$06
+         STA $8389
+         LDA $06
+         STA $836C
+         LDA $07
+         STA $836D
+L_8363
+         LDY $7A0A
+         LDX #$03
+L_8368
+         CLC
+         LDA ($04),Y
+         AND $097A
+         STA ($02),Y
+         INY
+         INC $836C
+         BNE L_8379
+         INC $836D
+L_8379
+         DEX
+         BNE L_8368
+         INC SPRITE_Y_ROW
+         JSR HGR_CALC_ADDR_ALT
+         DEC $8389
+         BNE L_8363
+         RTS
+         HEX 000070
+HOLE_DEPTH_OFFS
+         HEX 18120F0C0900
+HOURGLASS_TIMER
+         HEX 82
+TIMER_TICK_CTR
+         HEX 0E
+
+;--------------------------------------
+; ===== TIMER BAR =====
+; Draw 3-row bonus timer bar at row $B4
+;--------------------------------------
+DRAW_TIMER_BAR
+         CLC
+         LDA #$B4
+         STA SPRITE_Y_ROW
+         LDX #$03
+L_839B
+         CLC
+         JSR HGR_CALC_ADDR_ALT
+         LDY #$00
+L_83A1
+         TYA
+         LSR
+         BCC L_83A9
+         LDA #$AA
+         BNE L_83AC
+L_83A9
+         CLC
+         LDA #$D5
+L_83AC
+         CPY #$20
+         BCC L_83B2
+         EOR #$7F
+L_83B2
+         CLC
+         STA ($02),Y
+         INY
+         CPY #$26
+         BNE L_83A1
+         INC SPRITE_Y_ROW
+         DEX
+         BNE L_839B
+         LDA #$82
+         STA HOURGLASS_TIMER
+         RTS
+TICK_TIMER_BAR
+         CLC                            ; Shrink timer bar by masking one column per tick
+         INC TIMER_TICK_CTR
+         LDA TIMER_TICK_CTR
+         CMP #$20
+         BEQ L_83D2
+         RTS
+L_83D2
+         DEC HOURGLASS_TIMER
+         LDA #$82
+         SEC
+         SBC HOURGLASS_TIMER
+         STA SPRITE_X_COL
+         LDA #$B4
+         STA SPRITE_Y_ROW
+         LDX #$03
+L_83E5
+         JSR SPRITE_POS_SETUP
+         LDY $7A09
+         LDA TIMER_BAR_MASKS,Y
+         LDY $7A0A
+         CLC
+         AND ($02),Y
+         STA ($02),Y
+         INC SPRITE_Y_ROW
+         DEX
+         BNE L_83E5
+         LDA #$00
+         STA TIMER_TICK_CTR
+         RTS
+FILL_HOLE
+         CLC                            ; Fill hole: decrement depth, redraw, clear when empty
+         LDY DIG_HOLE_SLOT
+         LDA PLAYER_ACTION
+         LSR
+         BCC L_8415
+         CLC
+         LDA PLAYER_X
+         ADC #$07
+         JMP L_841B
+L_8415
+         SEC
+         LDA PLAYER_X
+         SBC #$07
+L_841B
+         CLC
+         STA SPRITE_X_COL
+         LDX DIG_HOLE_SLOT
+         DEC HOLE_DEPTH_TBL,X
+         CLC
+         LDA PLAYER_Y
+         ADC #$10
+L_842B
+         STA SPRITE_Y_ROW
+         JSR DRAW_HOLE
+         LDY DIG_HOLE_SLOT
+         LDA HOLE_DEPTH_TBL,Y
+         AND #$0F
+         BEQ L_843C
+         RTS
+L_843C
+         LDA #$00
+         STA HOLE_X_TABLE,Y
+         STA HOLE_DEPTH_TBL,Y
+         RTS
+TIMER_BAR_MASKS
+         HEX FF
+         INC $F8FC,X
+         BEQ L_842B
+         HEX 8080FF
+STOMP_ANIM
+         CLC                            ; Multi-frame stomping animation controller
+         LDX #$00
+         STX PLR_MOVING
+         STY DIG_HOLE_SLOT
+         INC DIG_ANIM_CTR
+         LDA DIG_ANIM_CTR
+         CMP $82BC
+         BNE L_8466
+         JSR FILL_HOLE
+         RTS
+L_8466
+         CMP $82BD
+         BNE L_846F
+         JSR SFX_IMPACT
+         RTS
+L_846F
+         CMP $82BF
+         BNE L_847A
+         LDA #$FF
+         STA DIG_SPR_TOGGLE
+         RTS
+L_847A
+         CMP $82BE
+         BNE L_8480
+         RTS
+L_8480
+         CMP $82C0
+         BNE L_848D
+         LDA #$00
+         STA DIG_ANIM_CTR
+         STA DIG_SPR_TOGGLE
+L_848D
+         RTS
+SFX_IMPACT
+         CLC                            ; Short percussive speaker tone for dig/stomp
+         LDY #$05
+L_8491
+         LDA $C030                      ; toggle speaker
+         LDX #$FF
+L_8496
+         DEX
+         BNE L_8496
+         DEY
+         BNE L_8491
+         RTS
+         HEX 00
+ENEMY_DRAW_X
+         HEX 80
+ENEMY_DRAW_Y
+         HEX 5C9E27
+ENEMY_ROW_CTR
+         HEX 0A03
+
+;--------------------------------------
+; ===== ENEMY SPRITE RENDERING =====
+; Erase enemy sprite via XOR
+;--------------------------------------
+ERASE_ENEMY
+         LDX $849D
+         BEQ L_84AB
+         INC $01
+L_84AB
+         LDX ENEMY_DRAW_X
+         STX SPRITE_X_COL
+         LDY ENEMY_DRAW_Y
+         STY SPRITE_Y_ROW
+         JSR SPRITE_POS_SETUP
+         LDA $7A09
+         CLC
+         ROL
+         ROL
+         ROL
+         ROL
+         ROL
+         STA $84A0
+         LDA #$00
+         STA ENEMY_ROW_CTR
+L_84CB
+         LDY ENEMY_DRAW_Y
+         STY SPRITE_Y_ROW
+         JSR HGR_CALC_ADDR_ALT
+         LDA #$00
+         STA $84A3
+         LDA $7A0A
+         STA $84A1
+L_84DF
+         LDY $84A0
+         CLC
+         LDA ($00),Y
+         LDY $84A1
+         CLC
+         EOR ($02),Y
+         CLC
+         ORA ($04),Y
+         CLC
+         STA ($02),Y
+         INC $84A1
+         INC $84A0
+         INC $84A3
+         LDA #$03
+         CMP $84A3
+         BNE L_84DF
+         INC ENEMY_DRAW_Y
+         INC ENEMY_ROW_CTR
+         LDA #$0A
+         CMP ENEMY_ROW_CTR
+         BNE L_84CB
+         RTS
+DRAW_ENEMY
+         LDX $849D                      ; Draw enemy sprite with mask+OR compositing
+         BEQ L_8516
+         INC $01
+L_8516
+         LDX ENEMY_DRAW_X
+         STX SPRITE_X_COL
+         LDY ENEMY_DRAW_Y
+         STY SPRITE_Y_ROW
+         JSR SPRITE_POS_SETUP
+         LDA $7A09
+         CLC
+         ROL
+         ROL
+         ROL
+         ROL
+         ROL
+         STA $84A0
+         LDA #$00
+         STA ENEMY_ROW_CTR
+L_8536
+         LDY ENEMY_DRAW_Y
+         STY SPRITE_Y_ROW
+         JSR HGR_CALC_ADDR_ALT
+         LDA #$00
+         STA $84A3
+         LDA $7A0A
+         STA $84A1
+L_854A
+         LDY $84A0
+         CLC
+         LDA $1600,Y
+         LDY $84A1
+         CLC
+         AND ($02),Y
+         LDY $84A0
+         CLC
+         ORA ($00),Y
+         LDY $84A1
+         CLC
+         STA ($02),Y
+         INC $84A1
+         INC $84A0
+         INC $84A3
+         LDA #$03
+         CMP $84A3
+         BNE L_854A
+         INC ENEMY_DRAW_Y
+         INC ENEMY_ROW_CTR
+         LDA #$0A
+         CMP ENEMY_ROW_CTR
+         BNE L_8536
+         RTS
+ENEMY_ACTIVE
+         ORA ($01,X)
+         ORA ($00,X)
+         BRK
+         HEX 0000000000
+ENEMY_SPR_LO_T
+         DS   10,$00                    ; zeroed
+ENEMY_SPR_HI_T
+         BPL L_85A7
+         BPL ENEMY_X_POS
+         BPL L_85AB
+         BPL L_85AD
+         BRK
+         HEX 00
+ENEMY_TYPE
+         HEX 00000000
+L_85A3
+         BRK
+         BRK
+         HEX 0000
+L_85A7
+         BRK
+         HEX 00
+ENEMY_X_POS
+         PHP
+         LSR
+L_85AB
+         HEX 8030
+L_85AD
+         BVC L_85CF
+         BVS L_8601
+         BRK
+         HEX 00
+ENEMY_Y_POS
+         HEX 46
+         STX $52
+         ASL $46
+         STX $26
+         ROL $00
+         BRK
+ENEMY_MOVE_DIR
+         HEX 02
+         ORA ($03,X)
+         BRK
+         HEX 000000000000
+ENEMY_TRAPPED
+         DS   8,$00                     ; zeroed
+L_85CF
+         BRK
+         HEX 00
+ENEMY_CUR_FRAME
+         HEX 00
+         ORA ($00,X)
+         BRK
+         ORA ($00,X)
+         ORA ($00,X)
+         ORA ($00,X)
+ENEMY_ALT_FRAME
+         ORA ($00,X)
+         ORA ($01,X)
+         BRK
+         ORA ($00,X)
+         ORA ($00,X)
+         ORA ($00,X)
+         BRK
+         DS   8,$00                     ; zeroed
+ENEMY_HOLE_REF
+         DS   10,$00                    ; zeroed
+ENEMY_CUR_SLOT
+         HEX 0486805B528F
+         BVC L_85A3
+L_8601
+         BRK
+         LDA #$01
+         RTS
+L_8605
+         LDA $C030                      ; toggle speaker
+         INX
+         BNE L_8605
+         RTS
+         HEX 8052
+UPDATE_ENEMY_SPR
+         CLC                            ; Swap animation frames, erase old, draw new position
+         LDY ENEMY_CUR_SLOT
+         LDA ENEMY_CUR_FRAME,Y
+         TAX
+         CLC
+         LDA ENEMY_ALT_FRAME,Y
+         CLC
+         STA ENEMY_CUR_FRAME,Y
+         TXA
+         CLC
+         STA ENEMY_ALT_FRAME,Y
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_SPR_LO_T,Y
+         STA $00
+         CLC
+         LDA ENEMY_SPR_HI_T,Y
+         STA $01
+         CLC
+         LDA ENEMY_ALT_FRAME,Y
+         STA $849D
+         CLC
+         LDA ENEMY_X_POS,Y
+         STA ENEMY_DRAW_X
+         STA $860C
+         CLC
+         LDA ENEMY_Y_POS,Y
+         STA ENEMY_DRAW_Y
+         STA $860D
+         JSR ERASE_ENEMY
+DRAW_ENEMY_MOVE
+         LDY ENEMY_CUR_SLOT             ; Draw enemy with directional offset
+         CLC
+         LDA ENEMY_SPR_LO_T,Y
+         STA $00
+         CLC
+         LDA ENEMY_SPR_HI_T,Y
+         STA $01
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_CUR_FRAME,Y
+         STA $849D
+         CLC
+         LDA ENEMY_MOVE_DIR,Y
+         BNE L_8672
+         JMP L_86E1
+L_8672
+         CMP #$01
+         BNE L_8679
+         JMP L_86CA
+L_8679
+         CMP #$02
+         BEQ L_86B3
+         CMP #$03
+         BEQ L_869A
+         LDX $860C
+         STX ENEMY_DRAW_X
+         LDY $860D
+         INY
+         INY
+         INY
+         INY
+         STY ENEMY_DRAW_Y
+         STY $860D
+         JSR DRAW_ENEMY
+         JMP L_86F0
+L_869A
+         LDX $860C
+         STX ENEMY_DRAW_X
+         LDY $860D
+         DEY
+         DEY
+         DEY
+         DEY
+         STY ENEMY_DRAW_Y
+         STY $860D
+         JSR DRAW_ENEMY
+         JMP L_86F0
+L_86B3
+         LDX $860C
+         DEX
+         DEX
+         STX ENEMY_DRAW_X
+         STX $860C
+         LDY $860D
+         STY ENEMY_DRAW_Y
+         JSR DRAW_ENEMY
+         JMP L_86F0
+L_86CA
+         LDX $860C
+         INX
+         INX
+         STX $860C
+         STX ENEMY_DRAW_X
+         LDY $860D
+         STY ENEMY_DRAW_Y
+         JSR DRAW_ENEMY
+         JMP L_86F0
+L_86E1
+         LDX $860C
+         STX ENEMY_DRAW_X
+         LDY $860D
+         STY ENEMY_DRAW_Y
+         JSR DRAW_ENEMY
+L_86F0
+         LDY ENEMY_CUR_SLOT
+         LDA $860C
+         CLC
+         STA ENEMY_X_POS,Y
+         LDA $860D
+         CLC
+         STA ENEMY_Y_POS,Y
+         RTS
+
+;--------------------------------------
+; ===== COLLISION DETECTION =====
+; Bounding box test: returns 1=overlap, 0=clear
+;--------------------------------------
+CHECK_COLLISION
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_X_POS,Y
+         STA $85FB
+         CLC
+         ADC #$06
+         STA $85FA
+         CLC
+         LDA ENEMY_Y_POS,Y
+         STA $85FD
+         CLC
+         ADC #$09
+         STA $85FC
+         LDA $87C5
+         CLC
+         ADC #$09
+         STA $85FE
+         LDA $87C4
+         CLC
+         ADC #$06
+         STA $85FF
+         CLC
+         LDA ENEMY_MOVE_DIR,Y
+         BEQ L_8794
+         CMP #$01
+         BNE L_874A
+         INC $85FA
+         INC $85FA
+         INC $85FB
+         INC $85FB
+         JMP L_8794
+L_874A
+         CMP #$02
+         BNE L_875D
+         DEC $85FA
+         DEC $85FA
+         DEC $85FB
+         DEC $85FB
+         JMP L_8794
+L_875D
+         CMP #$03
+         BNE L_877C
+         DEC $85FC
+         DEC $85FC
+         DEC $85FC
+         DEC $85FC
+         DEC $85FD
+         DEC $85FD
+         DEC $85FD
+         DEC $85FD
+         JMP L_8794
+L_877C
+         INC $85FC
+         INC $85FC
+         INC $85FC
+         INC $85FC
+         INC $85FD
+         INC $85FD
+         INC $85FD
+         INC $85FD
+L_8794
+         LDY $85FC
+         CPY $87C5
+         BCC L_87C1
+         CPY $85FD
+         BCC L_87A9
+         LDY $85FE
+         CPY $85FD
+         BCC L_87C1
+L_87A9
+         LDX $85FA
+         CPX $87C4
+         BCC L_87C1
+         CPX $85FB
+         BCC L_87BE
+         LDX $85FF
+         CPX $85FB
+         BCC L_87C1
+L_87BE
+         LDA #$01
+         RTS
+L_87C1
+         LDA #$00
+         RTS
+         HEX 4A86
+
+;--------------------------------------
+; ===== ENEMY AI ENGINE =====
+; Per-enemy update: check hole, handle trapped, move
+;--------------------------------------
+ENEMY_AI_TICK
+         JSR ENEMY_HOLE_FALL
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_ACTIVE,Y
+         BNE L_87D6
+         JSR GAME_DELAY
+         RTS
+L_87D6
+         LDA ENEMY_TRAPPED,Y
+         BEQ L_87DF
+         JSR ENEMY_TRAPPED
+         RTS
+L_87DF
+         CLC
+         LDA ENEMY_MOVE_DIR,Y
+         BEQ ENEMY_STOP
+         CMP #$01
+         BEQ L_8802
+         CMP #$02
+         BEQ L_8811
+         CMP #$03
+         BEQ L_8820
+         JMP L_883A
+         HEX 60
+ENEMY_STOP
+         LDY ENEMY_CUR_SLOT             ; Stop enemy, redraw in idle pose
+         LDA #$00
+         CLC
+         STA ENEMY_MOVE_DIR,Y
+         JSR UPDATE_ENEMY_SPR
+         RTS
+L_8802
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_X_POS,Y
+         CMP #$84
+         BEQ ENEMY_STOP
+         JSR ENEMY_VS_ENEMY
+         RTS
+L_8811
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_X_POS,Y
+         CMP #$00
+         BEQ ENEMY_STOP
+         JSR ENEMY_VS_ENEMY
+         RTS
+L_8820
+         JSR ENEMY_FLOOR_CHK
+         CMP #$00
+         BEQ ENEMY_STOP
+         CMP #$01
+         BEQ ENEMY_STOP
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CMP #$06
+         BEQ ENEMY_STOP
+         JSR ENEMY_VS_ENEMY
+         RTS
+L_883A
+         JSR ENEMY_FLOOR_CHK
+         CMP #$00
+         BEQ ENEMY_STOP
+         CMP #$02
+         BEQ ENEMY_STOP
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CMP #$A6
+         BEQ ENEMY_STOP
+         JSR ENEMY_VS_ENEMY
+         RTS
+ENEMY_VS_ENEMY
+         LDY #$00                       ; Check current enemy vs all other enemies
+         STY $8A82
+L_8859
+         LDY $8A82
+         CPY ENEMY_CUR_SLOT
+         BEQ L_8882
+         CLC
+         LDA ENEMY_ACTIVE,Y
+         BEQ L_8882
+         CLC
+         LDA ENEMY_X_POS,Y
+         STA $87C4
+         CLC
+         LDA ENEMY_Y_POS,Y
+         STA $87C5
+         JSR ENEMY_VS_PLAYER
+         JSR CHECK_COLLISION
+         CMP #$01
+         BNE L_8882
+         JMP ENEMY_STOP
+L_8882
+         INC $8A82
+         LDX #$0A
+         CPX $8A82
+         BNE L_8859
+         JMP L_88BF
+         HEX 60
+ENEMY_FLOOR_CHK
+         LDY ENEMY_CUR_SLOT             ; Check if enemy is at a floor/ladder junction
+         CLC
+         LDA ENEMY_X_POS,Y
+         TAX
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CLC
+         ADC #$09
+         STX $8A81
+         LDY $8A81
+         JSR CHECK_PLATFORM
+         RTS
+         BEQ L_88AE
+         JMP ENEMY_STOP
+L_88AE
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_Y_POS,Y
+         SEC
+         SBC #$06
+         AND #$1F
+         BEQ L_88BF
+         JMP ENEMY_STOP
+L_88BF
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_X_POS,Y
+         TAX
+         CLC
+         LDA ENEMY_MOVE_DIR,Y
+         CMP #$01
+         BEQ L_88D6
+         CMP #$02
+         BEQ L_88E1
+         JMP L_8908
+L_88D6
+         INX
+         INX
+         INX
+         INX
+         INX
+         INX
+         INX
+         INX
+         JMP L_88E9
+L_88E1
+         DEX
+         DEX
+         DEX
+         DEX
+         DEX
+         DEX
+         DEX
+         DEX
+L_88E9
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CLC
+         SEC
+         SBC #$06
+         AND #$1F
+         BNE L_8908
+         LDA ENEMY_Y_POS,Y
+         CLC
+         ADC #$09
+         TAY
+         TXA
+         JSR HOLE_AT_POS
+         PHA
+         PLA
+         BPL L_8908
+         JSR ENEMY_STOP
+         RTS
+L_8908
+         JMP UPDATE_ENEMY_SPR
+ENEMY_AI_DECIDE
+         LDA #$00                       ; Master AI: evaluate edges, ladders, player pos, pick dir
+         STA $8A80
+L_8910
+         LDY $8A80
+         CLC
+         LDA ENEMY_ACTIVE,Y
+         BNE L_891C
+         JMP L_8A0A
+L_891C
+         CLC
+         LDA ENEMY_MOVE_DIR,Y
+         CMP #$00
+         BEQ L_8955
+         CMP #$01
+         BEQ L_8936
+         CMP #$02
+         BEQ L_8936
+         JSR ENEMY_EDGE_CHK
+         CMP #$00
+         BEQ L_8955
+         JMP L_8A0A
+L_8936
+         LDY $8A80
+         CLC
+         LDA ENEMY_X_POS,Y
+         TAX
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CLC
+         ADC #$09
+         STX $8A81
+         LDY $8A81
+         JSR CHECK_PLATFORM
+         CMP #$00
+         BNE L_8955
+         JMP L_8A0A
+L_8955
+         LDY $8A80
+         CLC
+         LDA ENEMY_X_POS,Y
+         TAX
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CLC
+         ADC #$09
+         STX $8A81
+         LDY $8A81
+         JSR CHECK_PLATFORM
+         CMP #$00
+         BEQ L_89E9
+         CMP #$01
+         BEQ L_89C8
+         CMP #$02
+         BEQ L_89B0
+         JSR ENEMY_EDGE_CHK
+         CMP #$00
+         BNE L_89A3
+         JSR PSEUDO_RANDOM
+         CMP #$18
+         BCS L_898C
+L_8987
+         LDA #$01
+         JMP L_8A03
+L_898C
+         CMP #$90
+         BCS L_8995
+L_8990
+         LDA #$02
+         JMP L_8A03
+L_8995
+         CMP #$F0
+         BCS L_899E
+L_8999
+         LDA #$03
+         JMP L_8A03
+L_899E
+         LDA #$04
+         JMP L_8A03
+L_89A3
+         JSR PSEUDO_RANDOM
+         CMP #$80
+         BCS L_89AD
+         JMP L_8999
+L_89AD
+         JMP L_899E
+L_89B0
+         JSR ENEMY_EDGE_CHK
+         CMP #$00
+         BNE L_8999
+         JSR PSEUDO_RANDOM
+         CMP #$50
+         BCS L_89C1
+         JMP L_8987
+L_89C1
+         CMP #$A0
+         BCS L_8999
+         JMP L_8990
+L_89C8
+         JSR ENEMY_EDGE_CHK
+         CMP #$00
+         BNE L_89E4
+         JSR PSEUDO_RANDOM
+         CMP #$50
+         BCS L_89DB
+         LDA #$01
+         JMP L_8A03
+L_89DB
+         CMP #$A0
+         BCS L_89E4
+         LDA #$02
+         JMP L_8A03
+L_89E4
+         LDA #$04
+         JMP L_8A03
+L_89E9
+         JSR ENEMY_EDGE_CHK
+         CMP #$00
+         BNE L_8A01
+         JSR PSEUDO_RANDOM
+         CMP #$50
+         BCS L_89FC
+         LDA #$01
+         JMP L_8A03
+L_89FC
+         LDA #$02
+         JMP L_8A03
+L_8A01
+         LDA #$00
+L_8A03
+         LDY $8A80
+         CLC
+         STA ENEMY_MOVE_DIR,Y
+L_8A0A
+         INC $8A80
+         LDY #$0A
+         CPY $8A80
+         BEQ L_8A17
+         JMP L_8910
+L_8A17
+         RTS
+ENEMY_EDGE_CHK
+         LDY $8A80                      ; Return 1 if enemy mid-traversal, 0 if on floor edge
+         CLC
+         LDA ENEMY_Y_POS,Y
+         SEC
+         SBC #$06
+         AND #$1F
+         BEQ L_8A29
+         LDA #$01
+         RTS
+L_8A29
+         LDA #$00
+         RTS
+PSEUDO_RANDOM
+         LDY RANDOM_INDEX               ; Read pseudo-random byte from ROM $F800
+         CLC
+         LDA $F800,Y
+         INC RANDOM_INDEX
+         RTS
+         HEX 00
+L_8A38
+         LDA #$00
+         STA $8A37
+L_8A3D
+         LDY $8A37
+         CLC
+         LDA ENEMY_ACTIVE,Y
+         BEQ L_8A4F
+         STY ENEMY_CUR_SLOT
+         JSR ENEMY_POS_INIT
+         JSR DRAW_ENEMY_MOVE
+L_8A4F
+         INC $8A37
+         LDY #$0A
+         CPY $8A37
+         BNE L_8A3D
+L_8A59
+         LDA #$00
+         STA $8A37
+L_8A5E
+         LDY $8A37
+         CLC
+         LDA ENEMY_ACTIVE,Y
+         BEQ L_8A70
+         STY ENEMY_CUR_SLOT
+         JSR ENEMY_AI_TICK
+         JSR ENEMY_AI_DECIDE
+L_8A70
+         INC $8A37
+         LDY #$0A
+         CPY $8A37
+         BNE L_8A5E
+         JSR UPDATE_PLAYER
+         JMP L_8A59
+         ASL
+         LSR
+         ASL
+ENEMY_POS_INIT
+         LDY ENEMY_CUR_SLOT             ; Copy enemy pos from state tables to drawing params
+         CLC
+         LDA ENEMY_X_POS,Y
+         STA ENEMY_DRAW_X
+         STA $860C
+         CLC
+         LDA ENEMY_Y_POS,Y
+         STA ENEMY_DRAW_Y
+         STA $860D
+         RTS
+RANDOM_INDEX
+         HEX E2000060
+ENEMY_VS_PLAYER
+         LDY ENEMY_CUR_SLOT             ; Bounding box test: enemy vs player -> death if overlap
+         CLC
+         LDA ENEMY_X_POS,Y
+         STA $85FB
+         CLC
+         ADC #$04
+         STA $85FA
+         CLC
+         LDA ENEMY_Y_POS,Y
+         STA $85FD
+         CLC
+         ADC #$07
+         STA $85FC
+         LDA PLAYER_Y
+         CLC
+         ADC #$0E
+         STA $85FE
+         LDA PLAYER_X
+         CLC
+         ADC #$04
+         STA $85FF
+         CLC
+         LDA ENEMY_MOVE_DIR,Y
+         BEQ L_8B31
+         CMP #$01
+         BNE L_8AE7
+         INC $85FA
+         INC $85FA
+         INC $85FB
+         INC $85FB
+         JMP L_8B31
+L_8AE7
+         CMP #$02
+         BNE L_8AFA
+         DEC $85FA
+         DEC $85FA
+         DEC $85FB
+         DEC $85FB
+         JMP L_8B31
+L_8AFA
+         CMP #$03
+         BNE L_8B19
+         DEC $85FC
+         DEC $85FC
+         DEC $85FC
+         DEC $85FC
+         DEC $85FD
+         DEC $85FD
+         DEC $85FD
+         DEC $85FD
+         JMP L_8B31
+L_8B19
+         INC $85FC
+         INC $85FC
+         INC $85FC
+         INC $85FC
+         INC $85FD
+         INC $85FD
+         INC $85FD
+         INC $85FD
+L_8B31
+         LDY $85FC
+         CPY PLAYER_Y
+         BCC L_8B5F
+         CPY $85FD
+         BCC L_8B46
+         LDY $85FE
+         CPY $85FD
+         BCC L_8B5F
+L_8B46
+         LDX $85FA
+         CPX PLAYER_X
+         BCC L_8B5F
+         CPX $85FB
+         BCC L_8B5B
+         LDX $85FF
+         CPX $85FB
+         BCC L_8B5F
+L_8B5B
+         JMP L_910F
+         HEX 60
+L_8B5F
+         RTS
+HOLE_AT_POS
+         LDX #$0F                       ; Search hole table for hole at column A, row Y
+         DEY
+L_8B63
+         CLC
+         INY
+         DEX
+         BEQ L_8B72
+         CMP HOLE_X_TABLE,Y
+         BNE L_8B63
+         CLC
+         LDA HOLE_DEPTH_TBL,Y
+         RTS
+L_8B72
+         CLC
+         LDA #$00
+         RTS
+ENEMY_HOLE_FALL
+         LDY ENEMY_CUR_SLOT             ; Check if enemy over hole -> begin fall if yes
+         CLC
+         LDA ENEMY_X_POS,Y
+         TAX
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CLC
+         SEC
+         SBC #$06
+         AND #$1F
+         BNE L_8B9C
+         LDA ENEMY_Y_POS,Y
+         CLC
+         ADC #$09
+         TAY
+         TXA
+         JSR HOLE_AT_POS
+         CMP #$00
+         BEQ L_8B9E
+         JMP L_8B9F
+L_8B9C
+         LDA #$00
+L_8B9E
+         RTS
+L_8B9F
+         TAX
+         CLC
+         LDA HOLE_DEPTH_TBL,Y
+         ORA #$80
+         CLC
+         STA HOLE_DEPTH_TBL,Y
+         TYA
+         LDY ENEMY_CUR_SLOT
+         CLC
+         STA ENEMY_HOLE_REF,Y
+         TXA
+         CLC
+         CMP #$05
+         BNE L_8BDF
+         LDA #$80
+         LDY ENEMY_CUR_SLOT
+         CLC
+         STA ENEMY_FALL_DEPTH,Y
+         LDA #$01
+         CLC
+         STA ENEMY_TRAPPED,Y
+         CLC
+         JSR ERASE_CUR_ENEMY
+         LDA #$05
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CLC
+         ADC #$09
+         CLC
+         STA ENEMY_Y_POS,Y
+         JSR DRAW_CUR_ENEMY
+         RTS
+L_8BDF
+         TAX
+         LDA #$00
+         LDY ENEMY_CUR_SLOT
+         CLC
+         STA ENEMY_FALL_DEPTH,Y
+         LDA #$01
+         CLC
+         STA ENEMY_TRAPPED,Y
+         CLC
+         TXA
+         CMP #$04
+         BNE L_8C0A
+         JSR ERASE_CUR_ENEMY
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CLC
+         ADC #$05
+         CLC
+         STA ENEMY_Y_POS,Y
+         JSR DRAW_CUR_ENEMY
+         RTS
+L_8C0A
+         CMP #$03
+         BNE L_8C23
+         JSR ERASE_CUR_ENEMY
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CLC
+         ADC #$04
+         CLC
+         STA ENEMY_Y_POS,Y
+         JSR DRAW_CUR_ENEMY
+         RTS
+L_8C23
+         CMP #$02
+         BNE L_8C3C
+         JSR ERASE_CUR_ENEMY
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CLC
+         ADC #$03
+         CLC
+         STA ENEMY_Y_POS,Y
+         JSR DRAW_CUR_ENEMY
+         RTS
+L_8C3C
+         JSR ERASE_CUR_ENEMY
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CLC
+         ADC #$02
+         CLC
+         STA ENEMY_Y_POS,Y
+         JSR DRAW_CUR_ENEMY
+         RTS
+ERASE_CUR_ENEMY
+         LDY ENEMY_CUR_SLOT             ; Erase current enemy sprite from screen
+         CLC
+         LDA ENEMY_X_POS,Y
+         STA ENEMY_DRAW_X
+         CLC
+         LDA ENEMY_Y_POS,Y
+         STA ENEMY_DRAW_Y
+         CLC
+         LDA ENEMY_CUR_FRAME,Y
+         STA $849D
+         CLC
+         LDA ENEMY_SPR_LO_T,Y
+         STA $00
+         CLC
+         LDA ENEMY_SPR_HI_T,Y
+         STA $01
+         JSR ERASE_ENEMY
+         RTS
+DRAW_CUR_ENEMY
+         LDY ENEMY_CUR_SLOT             ; Draw current enemy sprite to screen
+         CLC
+         LDA ENEMY_SPR_LO_T,Y
+         STA $00
+         CLC
+         LDA ENEMY_SPR_HI_T,Y
+         STA $01
+         CLC
+         LDA ENEMY_CUR_FRAME,Y
+         STA $849D
+         CLC
+         LDA ENEMY_X_POS,Y
+         STA ENEMY_DRAW_X
+         CLC
+         LDA ENEMY_Y_POS,Y
+         STA ENEMY_DRAW_Y
+         JSR DRAW_ENEMY
+         RTS
+ENEMY_TRAPPED
+         LDY ENEMY_CUR_SLOT             ; Handle enemy trapped in hole: count down or climb out
+         CLC
+         LDA ENEMY_FALL_DEPTH,Y
+         BNE L_8CAD
+         JMP L_8CE2
+L_8CAD
+         CLC
+         LDA ENEMY_HOLE_REF,Y
+         TAY
+         CLC
+         LDA HOLE_DEPTH_TBL,Y
+         BNE L_8CBB
+         JMP L_8E61
+L_8CBB
+         JSR ERASE_CUR_ENEMY
+         CLC
+         LDY ENEMY_CUR_SLOT
+         LDA ENEMY_CUR_FRAME,Y
+         TAX
+         CLC
+         LDA ENEMY_ALT_FRAME,Y
+         CLC
+         STA ENEMY_CUR_FRAME,Y
+         TXA
+         CLC
+         STA ENEMY_ALT_FRAME,Y
+         CLC
+         LDA ENEMY_FALL_DEPTH,Y
+         TAX
+         DEX
+         TXA
+         CLC
+         STA ENEMY_FALL_DEPTH,Y
+         JSR DRAW_CUR_ENEMY
+         RTS
+L_8CE2
+         JSR ERASE_CUR_ENEMY
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_Y_POS,Y
+         TAX
+         DEX
+         TXA
+         CLC
+         STA ENEMY_Y_POS,Y
+         CLC
+         LDA ENEMY_CUR_FRAME,Y
+         TAX
+         CLC
+         LDA ENEMY_ALT_FRAME,Y
+         CLC
+         STA ENEMY_CUR_FRAME,Y
+         TXA
+         CLC
+         STA ENEMY_ALT_FRAME,Y
+         JSR DRAW_CUR_ENEMY
+         JSR ENEMY_LANDED
+         CMP #$00
+         BNE L_8D1F
+         LDA #$00
+         LDY ENEMY_CUR_SLOT
+         CLC
+         STA ENEMY_FALL_DEPTH,Y
+         STA ENEMY_TRAPPED,Y
+         JSR CLEAR_HOLE_ENTRY
+         RTS
+L_8D1F
+         RTS
+ENEMY_LANDED
+         LDY ENEMY_CUR_SLOT             ; Check if falling enemy landed on a floor
+         CLC
+         LDA ENEMY_Y_POS,Y
+         SEC
+         SBC #$06
+         AND #$1F
+         BEQ L_8D31
+         LDA #$01
+         RTS
+L_8D31
+         LDA #$00
+         RTS
+         HEX 0E
+CLEAR_HOLE_ENTRY
+         LDY ENEMY_CUR_SLOT             ; Clear hole table entry at fall column
+         CLC
+         LDA ENEMY_X_POS,Y
+         STA $8D34
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CLC
+         ADC #$09
+         TAY
+         LDX #$0F
+L_8D49
+         CLC
+         LDA HOLE_X_TABLE,Y
+         CMP $8D34
+         BEQ L_8D59
+         INY
+         DEX
+         BEQ L_8D62
+         JMP L_8D49
+L_8D59
+         LDA #$00
+         CLC
+         STA HOLE_X_TABLE,Y
+         STA HOLE_DEPTH_TBL,Y
+L_8D62
+         RTS
+         HEX F3F3F3FFFFFFFFFFFFFFFFFFFFFFFFFF
+         DS   141,$FF                   ; unused
+
+;--------------------------------------
+; ===== ENEMY MANAGEMENT =====
+; Draw all enemies at starting positions
+;--------------------------------------
+DRAW_ALL_ENEMIES
+         LDY #$00
+         STY ENEMY_CUR_SLOT
+L_8E05
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_ACTIVE,Y
+         BEQ L_8E1D
+         JSR ENEMY_POS_INIT
+         JSR DRAW_ENEMY_MOVE
+         JSR SFX_SPAWN
+         INC ENEMY_CUR_SLOT
+         JMP L_8E05
+L_8E1D
+         LDA #$00
+         STA ENEMY_CUR_SLOT
+         RTS
+ENEMY_UPDATE
+         LDY ENEMY_CUR_SLOT             ; Update one enemy per call (round-robin through slots)
+         CLC
+         LDA ENEMY_ACTIVE,Y
+         BEQ L_8E38
+         JSR ENEMY_VS_PLAYER
+         JSR ENEMY_AI_TICK
+         JSR ENEMY_DISPATCH
+         JMP L_8E3B
+L_8E38
+         JSR DELAY_LONG
+L_8E3B
+         INC ENEMY_CUR_SLOT
+         LDY #$08
+         CPY ENEMY_CUR_SLOT
+         BNE L_8E4A
+         LDA #$00
+         STA ENEMY_CUR_SLOT
+L_8E4A
+         RTS
+ENEMY_DISPATCH
+         LDY ENEMY_CUR_SLOT             ; Call AI if enemy active, else check spawn
+         CLC
+         LDA ENEMY_ACTIVE,Y
+         BEQ L_8E58
+         JSR ENEMY_AI_DECIDE
+         RTS
+L_8E58
+         JSR ENEMY_SPAWN_NOP
+         RTS
+ENEMY_SPAWN_NOP
+         RTS
+         JMP L_8E61
+CHAIN_KILL_FLAG
+         HEX 01
+L_8E61
+         LDY #$00
+         LDA #$00
+         STA KILL_COUNTER
+         STA CHAIN_KILL_FLAG
+         CLC
+L_8E6C
+         STA KILL_BONUS_BASE,Y
+         STA KILL_BONUS_ACCUM,Y
+         INY
+         CPY #$06
+         BNE L_8E6C
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_TYPE,Y
+         CLC
+         ADC #$01
+         STA KILL_BONUS_BASE
+         STA KILL_BONUS_ACCUM
+L_8E87
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_Y_POS,Y
+         SEC
+         SBC #$06
+         CLC
+         AND #$1F
+         BEQ L_8E9C
+         JSR ENEMY_CRUSH_CHK
+         JMP L_8F4D
+L_8E9C
+         CLC
+         LDA ENEMY_X_POS,Y
+         TAX
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CLC
+         ADC #$09
+         TAY
+         TXA
+         JSR HOLE_AT_POS
+         CMP #$05
+         BEQ L_8EB9
+         CMP #$85
+         BEQ L_8EC2
+         JSR ENEMY_DEATH
+         RTS
+L_8EB9
+         JSR SCORE_MULTIPLY
+         JSR POST_KILL
+         JMP L_8F4D
+L_8EC2
+         JSR SCORE_MULTIPLY
+         JSR POST_KILL
+         LDX #$01
+         STX CHAIN_KILL_FLAG
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_X_POS,Y
+         STA $8F6C
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CLC
+         ADC #$09
+         STA $8F6D
+         LDY #$00
+L_8EE3
+         CPY ENEMY_CUR_SLOT
+         BEQ L_8EF7
+         CLC
+         LDA ENEMY_ACTIVE,Y
+         BEQ L_8EF7
+         CLC
+         LDA ENEMY_X_POS,Y
+         CMP $8F6C
+         BEQ L_8EFD
+L_8EF7
+         INY
+         CPY #$0A
+         BNE L_8EE3
+         RTS
+L_8EFD
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CMP $8F6D
+         BNE L_8EF7
+         STY $8FDF
+         LDX ENEMY_CUR_SLOT
+         STX $8FE0
+         LDY $8FDF
+         STY ENEMY_CUR_SLOT
+         JSR ERASE_CUR_ENEMY
+         LDA #$00
+         LDY $8FDF
+         CLC
+         STA ENEMY_FALL_DEPTH,Y
+         STA ENEMY_TRAPPED,Y
+         STA ENEMY_HOLE_REF,Y
+         STA ENEMY_ACTIVE,Y
+         CLC
+         LDA ENEMY_TYPE,Y
+         CLC
+         ADC #$01
+         LDX $8FE0
+         STX ENEMY_CUR_SLOT
+         PHA
+         LDY #$00
+L_8F3A
+         CLC
+         LDA KILL_BONUS_BASE,Y
+         BEQ L_8F44
+         INY
+         JMP L_8F3A
+L_8F44
+         INY
+         PLA
+         CLC
+         STA KILL_BONUS_ACCUM,Y
+         STA KILL_BONUS_BASE,Y
+L_8F4D
+         JSR ERASE_CUR_ENEMY
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CLC
+         ADC #$01
+         CLC
+         STA ENEMY_Y_POS,Y
+         JSR DRAW_CUR_ENEMY
+         LDX #$00
+L_8F63
+         LDA $C030                      ; toggle speaker
+         INX
+         BNE L_8F63
+         JMP L_8E87
+         HEX 0E6F
+ENEMY_CRUSH_CHK
+         LDA #$00                       ; Check if falling enemy crushes another enemy below
+         STA $8FE1
+L_8F73
+         LDY $8FE1
+         CPY ENEMY_CUR_SLOT
+         BEQ L_8FD4
+         CLC
+         LDA ENEMY_ACTIVE,Y
+         BNE L_8F84
+         JMP L_8FD4
+L_8F84
+         CLC
+         LDA ENEMY_X_POS,Y
+         STA $87C4
+         CLC
+         LDA ENEMY_Y_POS,Y
+         STA $87C5
+         JSR CHECK_COLLISION
+         CMP #$00
+         BEQ L_8FD4
+         LDX ENEMY_CUR_SLOT
+         STX $8FDF
+         LDY $8FE1
+         STY ENEMY_CUR_SLOT
+         JSR ERASE_CUR_ENEMY
+         CLC
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_X_POS,Y
+         TAX
+         CLC
+         LDA ENEMY_Y_POS,Y
+         STA $8FE0
+         CLC
+         LDA ENEMY_TYPE,Y
+         CLC
+         ADC #$01
+         LDY $8FE0
+         JSR DRAW_NUMBER
+         LDY ENEMY_CUR_SLOT
+         LDA #$00
+         CLC
+         STA ENEMY_ACTIVE,Y
+         LDY $8FDF
+         STY ENEMY_CUR_SLOT
+L_8FD4
+         INC $8FE1
+         LDX #$0A
+         CPX $8FE1
+         BNE L_8F73
+         RTS
+         HEX 12020A
+ENEMY_DEATH
+         LDA CHAIN_KILL_FLAG            ; Handle enemy death: award score, remove, check bonus
+         BNE L_8FF1
+         JSR BONUS_KILL_CHK
+         CMP #$00
+         BEQ L_8FF1
+         JMP L_909D
+L_8FF1
+         JSR ERASE_CUR_ENEMY
+         LDY ENEMY_CUR_SLOT
+         LDA #$00
+         CLC
+         STA ENEMY_ACTIVE,Y
+         STA ENEMY_FALL_DEPTH,Y
+         STA ENEMY_TRAPPED,Y
+         STA ENEMY_HOLE_REF,Y
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_X_POS,Y
+         TAX
+         CLC
+         LDA ENEMY_Y_POS,Y
+         STA $8FDF
+         CLC
+         LDA ENEMY_TYPE,Y
+         CLC
+         ADC #$01
+         LDY $8FDF
+         JSR AWARD_SCORE
+         RTS
+AWARD_SCORE
+         LDY #$00                       ; Tally bonus multiplier and display kill score
+         STY $8FDF
+L_9028
+         CLC
+         LDA KILL_BONUS_ACCUM,Y
+         CLC
+         ADC $8FDF
+         STA $8FDF
+         INY
+         CPY #$06
+         BNE L_9028
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_X_POS,Y
+         TAX
+         CLC
+         LDA ENEMY_Y_POS,Y
+         TAY
+         LDA $8FDF
+         JSR DRAW_NUMBER
+         RTS
+KILL_COUNTER
+         HEX 03
+BONUS_KILL_CHK
+         LDY ENEMY_CUR_SLOT             ; Check bonus kill conditions for chain scoring
+         CLC
+         LDA ENEMY_TYPE,Y
+         BEQ L_906B
+         CMP #$01
+         BNE L_9062
+         LDA KILL_COUNTER
+         BNE L_906B
+L_905F
+         LDA #$01
+         RTS
+L_9062
+         LDA KILL_COUNTER
+         BEQ L_905F
+         CMP #$01
+         BEQ L_905F
+L_906B
+         LDA #$00
+         RTS
+SCORE_MULTIPLY
+         LDY #$00                       ; Accumulate chain-kill bonus values
+L_9070
+         LDA KILL_BONUS_ACCUM,Y
+         BEQ L_9083
+         STA $8FDF
+         LDA KILL_BONUS_BASE,Y
+         CLC
+         ADC $8FDF
+         CLC
+         STA KILL_BONUS_ACCUM,Y
+L_9083
+         INY
+         CPY #$06
+         BNE L_9070
+         RTS
+         HEX 00
+POST_KILL
+         JSR CLEAR_HOLE_ENTRY           ; Clear hole at kill position, increment kill counter
+         INC KILL_COUNTER
+         RTS
+KILL_BONUS_BASE
+         HEX 030003000000
+KILL_BONUS_ACCUM
+         HEX 0C00
+         ASL $00
+         BRK
+         HEX 00
+L_909D
+         JSR ERASE_CUR_ENEMY
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA ENEMY_Y_POS,Y
+         CLC
+         ADC #$09
+         STA $910E
+         CLC
+         LDA ENEMY_X_POS,Y
+         STA $910D
+         CLC
+         LDX #$0F
+         LDY $910E
+         DEY
+L_90BB
+         CLC
+         LDA $910D
+         INY
+         DEX
+         BEQ L_90FA
+         SEC
+         SBC HOLE_X_TABLE,Y
+         BPL L_90CE
+         EOR #$FF
+         CLC
+         ADC #$01
+L_90CE
+         CMP #$06
+         BCS L_90BB
+         LDA HOLE_DEPTH_TBL,Y
+         CMP #$05
+         BEQ L_90FA
+         CMP #$00
+         BEQ L_90FA
+         LDA HOLE_X_TABLE,Y
+         CMP $910D
+         BCS L_90F1
+         ADC #$08
+         LDY ENEMY_CUR_SLOT
+         CLC
+         STA ENEMY_X_POS,Y
+         JMP L_90FA
+L_90F1
+         SBC #$08
+         LDY ENEMY_CUR_SLOT
+         CLC
+         STA ENEMY_X_POS,Y
+L_90FA
+         JSR DRAW_CUR_ENEMY
+         LDY ENEMY_CUR_SLOT
+         CLC
+         LDA #$00
+         STA ENEMY_TRAPPED,Y
+         STA ENEMY_FALL_DEPTH,Y
+         JSR RESPAWN_ANIM
+         RTS
+         HEX 0EAF
+L_910F
+         JSR ERASE_CUR_ENEMY
+         LDY ENEMY_CUR_SLOT
+         LDA PLAYER_X
+         CLC
+         STA ENEMY_X_POS,Y
+         LDA PLAYER_Y
+         CLC
+         STA ENEMY_Y_POS,Y
+         JSR DRAW_CUR_ENEMY
+         JMP L_7657
+         HEX 0060
+
+;--------------------------------------
+; ===== ENEMY SOUND EFFECTS =====
+; Two-tone spawn beep
+;--------------------------------------
+SFX_SPAWN
+         LDA $C030
+         JSR DELAY_SHORT
+         LDA $C030                      ; toggle speaker
+         JSR DELAY_MEDIUM
+         RTS
+DELAY_SHORT
+         LDX #$00
+L_913A
+         INX
+         CPX #$F8
+         BNE L_913A
+         RTS
+DELAY_MEDIUM
+         LDA #$00
+         TAX
+         TAY
+L_9144
+         INY
+         BNE L_9144
+         INX
+         BNE L_9144
+         RTS
+DELAY_LONG
+         LDA #$F3
+         TAX
+         TAY
+L_914F
+         INY
+         BNE L_914F
+         INX
+         BNE L_914F
+         RTS
+RESPAWN_ANIM
+         JSR ERASE_CUR_ENEMY            ; 4-phase respawn animation with sound
+         JSR DRAW_CUR_ENEMY
+         JSR SFX_RESPAWN_A
+         JSR ANIM_FRAME_DELAY
+         LDA #$00
+         STA $91E2
+L_9167
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         NOP
+         JSR SFX_RESPAWN_B
+         JSR ANIM_FRAME_DELAY
+         NOP
+         NOP
+         NOP
+         INC $91E2
+         LDA #$04
+         CMP $91E2
+         BNE L_9167
+         RTS
+ANIM_FRAME_DELAY
+         LDA #$60
+         TAX
+         TAY
+L_9197
+         INY
+         BNE L_9197
+         INX
+         BNE L_9197
+         RTS
+SFX_RESPAWN_A
+         LDA #$00
+         STA $91E3
+L_91A3
+         LDA $C030                      ; toggle speaker
+         LDX #$20
+         JSR DELAY_TINY
+         LDA $C030                      ; toggle speaker
+         LDX #$16
+         JSR DELAY_TINY
+         INC $91E3
+L_91B6
+         LDX #$60
+         CPX $91E3
+         BNE L_91A3
+         RTS
+SFX_RESPAWN_B
+         LDA #$00
+         STA $91E3
+L_91C3
+         LDA $C030                      ; toggle speaker
+         LDX #$20
+         JSR DELAY_TINY
+         LDA $C030                      ; toggle speaker
+         LDX #$05
+         JSR DELAY_TINY
+         INC $91E3
+         LDX #$60
+         CPX $91E3
+         BNE L_91C3
+         RTS
+DELAY_TINY
+         DEX
+         BNE DELAY_TINY
+         RTS
+         HEX 0460
+         ADC ($28,X)
+         CMP ($D0,X)
+         BNE L_91B6
+         CMP $A0
+L_91EC
+         CMP #$C9                       ; key 'I' (up)
+         LDY #$D3
+         HEX D4
+         CMP ($CE,X)
+         CPY $C1
+         HEX D2
+         CPY $A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$D3
+         CMP $D4D3,Y
+         CMP $CD
+         LDY #$CD
+         CMP ($D3,X)
+         HEX D4
+         CMP $D2
+         AND #$01
+         ORA $46
+         BRK
+         EOR $2001,X
+         BVC L_9218
+L_9218
+         EOR $ADAD,X
+         BNE L_91EC
+         HEX CB
+         CMP $A0
+         CPY $CEC1
+         HEX C7D5
+         CMP ($C7,X)
+         CMP $A0
+         HEX C3
+         CMP ($D2,X)
+         CPY $A0
+         DEC $C9
+         DEC $C5C4
+         HEX D201
+         EOR $5A,X
+         BRK
+         HEX 64B70003
+         ADC $B0
+         BRK
+         HEX 000364B7
+         ORA ($03,X)
+         ADC $B1
+         LDA $0300
+         HEX 64B70203
+         ADC $B0
+         BRK
+         HEX 000364B70303
+         ADC $B2
+         CPX #$00
+         HEX 0364B70403
+         ADC $B7
+         PHA
+         BRK
+         HEX 0364B7
+         ORA $03
+         ADC $B1
+         LDA $0300
+         HEX 64B7
+         ASL $03
+         ADC $B1
+         STA ($00,X)
+         HEX 0364B70703
+         ADC $B1
+         CPY #$00
+         HEX 0364B70803
+         ADC $B1
+         PLA
+         BRK
+         HEX 0301
+         EOR $5F,X
+         BRK
+         HEX 64B7
+         ORA #$03
+         ADC $B7
+         PHA
+         BRK
+         HEX 0364B70A03
+         ADC $B2
+         CMP $0300
+         HEX 64B70B03
+         ADC $B0
+         BRK
+         HEX 000364B70C03
+         ADC $B2
+         CPX #$00
+         HEX 0364B7
+         ORA $6503
+         HEX B2D0000364B7
+         ASL $6503
+         HEX B323000364B70F03
+         ADC $B1
+         LDA $0300
+         HEX 64B7
+         BPL L_92D3
+         ADC $B1
+         HEX 83
+L_92D3
+         BRK
+         HEX 0364B7
+         ORA ($03),Y
+         ADC $B1
+         CPY #$00
+         HEX 0301
+         EOR $64,X
+         BRK
+         HEX 64B71203
+         ADC $B1
+         LDA $0300
+         HEX 64B7130365
+         LDA ($83),Y
+         BRK
+         HEX 0364B71403
+         ADC $B1
+         CPY #$00
+         HEX 0364B715
+
+;--------------------------------------
+; ===== LEVEL TRANSITION =====
+; Cap level at 7, jump to level load
+;--------------------------------------
+L_9300
+         CLC
+         LSR
+         LSR
+         CMP #$07
+         BCC L_9309
+         LDA #$07
+L_9309
+         CLC
+         JMP L_74A2
+L_930D
+         CLC
+         LDY #$00
+L_9310
+         CLC
+         LDA ENEMY_ACTIVE,Y
+         INY
+         CPY #$09
+         BEQ L_931E
+         CMP #$00
+         BEQ L_9310
+         RTS
+L_931E
+         CLC
+         JSR BONUS_TO_SCORE
+         JSR DRAW_SCORE
+         INC CURRENT_LEVEL
+         LDA #$31
+         CMP CURRENT_LEVEL
+         BEQ L_9332
+         JMP L_7485
+L_9332
+         LDX #$00
+         JSR $F94A
+L_9337
+         JSR $F94A
+         JSR $F94A
+         JSR $F94A
+         LDA $C054                      ; select page 1
+         LDA $C051                      ; set text mode
+         LDA #$00
+         STA $93FF
+L_934B
+         CLC
+         LDY $93FF
+         LDA $9360,Y
+         BEQ L_935D
+         JSR $FDF0
+         INC $93FF
+         JMP L_934B
+L_935D
+         JMP $FF69
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         STA $A0A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         HEX D3D4C1D2D4
+         LDY #$C1
+         CPY $C4
+         HEX D2C5D3D3
+         LDY #$BD
+         LDY #$A4
+         HEX B7
+         BCS L_9337
+         BCS L_9316
+         STA $A08D
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$D0
+         HEX D2CF
+L_9398
+         HEX C7D2
+         CMP ($CD,X)
+         CMP $C4
+         LDY #$C2
+         CMP $D4A0,Y
+         LDX $C1CE
+         HEX C7
+         CMP ($D7,X)
+         CMP ($8D,X)
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$D3
+         LDX $C5C2
+         BNE L_9398
+         CMP $8D,X
+         STA $A0A0
+         LDY #$A0
+         LDY #$A0
+         LDY #$A0
+         TAY
+         HEX CFCB
+         CMP ($D9,X)
+         CMP ($CD,X)
+         CMP ($A0,X)
+         CMP $CE,X
+         CMP #$D6
+         CMP $D2
+         HEX D3
+         CMP #$D4
+         CMP $CFA0,Y
+         DEC $A0
+         HEX D3C3
+         CMP #$C5                       ; key 'E' (stomp)
+         DEC $C5C3
+         LDA #$8D
+         STA $008D
+         HEX C3
+         CMP #$C5                       ; key 'E' (stomp)
+         DEC $C5C3
+         LDA #$8D
+         STA $3095
+         HEX FA
+         PLA
+         TAY
+         PLA
+         CPY $70
+         BCC L_940F
+         BNE L_9410
+         CMP $6F
+         BCS L_9410
+L_940F
+         RTS
+L_9410
+         LDX #$4D
+         BIT $D8
+         BPL L_9419
+         JMP $F2E9
+L_9419
+         JSR $DAFB
+         JSR $DB5A
+L_941F
+         LDA $D260,X
+         PHA
+         JSR $DB5C
+         INX
+         PLA
+         BPL L_941F
+         JSR $D683
+         LDA #$50
+         LDY #$D3
+         JSR $DB3A
+         LDY $76
+         INY
+         BEQ L_943C
+         JSR $ED19
+L_943C
+         JSR $DAFB
+         LDX #$DD
+         JSR $D52E
+         STX $B8
+         STY $B9
+         LSR $D8
+         JSR $00B1
+         TAX
+         BEQ L_943C
+         LDX #$FF
+         STX $76
+         BCC L_945C
+         JSR $D559
+         JMP $D805
+L_945C
+         LDX $AF
+         STX $69
+         LDX $B0
+         STX $6A
+         JSR $DA0C
+         JSR $D559
+         STY $0F
+         JSR $D61A
+         BCC L_94B5
+         LDY #$01
+         LDA ($9B),Y
+         STA $5F
+         LDA $69
+         STA $5E
+         LDA $9C
+         STA $61
+         LDA $9B
+         DEY
+         SBC ($9B),Y
+         CLC
+         ADC $69
+         STA $69
+         STA $60
+         LDA $6A
+         ADC #$FF
+         STA $6A
+         SBC $9C
+         TAX
+         SEC
+         LDA $9B
+         SBC $69
+         TAY
+         BCS L_949F
+         INX
+         DEC $61
+L_949F
+         CLC
+         ADC $5E
+         BCC L_94A7
+         DEC $5F
+         CLC
+L_94A7
+         LDA ($5E),Y
+         STA ($60),Y
+         INY
+         BNE L_94A7
+         INC $5F
+         INC $61
+         DEX
+         BNE L_94A7
+L_94B5
+         LDA $0200
+         BEQ L_94F2
+         LDA $73
+         LDY $74
+         STA $6F
+         STY $70
+         LDA $69
+         STA $96
+         ADC $0F
+         STA $94
+         LDY $6A
+         STY $97
+         BCC L_94D1
+         INY
+L_94D1
+         STY $95
+         JSR $D393
+         LDA $50
+         LDY $51
+         STA $01FE
+         STY $01FF
+         LDA $6D
+         LDY $6E
+         STA $69
+         STY $6A
+         LDY $0F
+L_94EA
+         LDA $01FB,Y
+         DEY
+         STA ($9B),Y
+         BNE L_94EA
+L_94F2
+         JSR $D665
+         LDA $67
+         LDY $68
+         STA $5E
+         STY $5F
+         CLC
+L_94FE
+         LDY #$01
+         LDA ($5E),Y
+         BNE L_950F
+         LDA $69
+         STA $AF
+         LDA $6A
+         STA $B0
+         JMP $D43C
+L_950F
+         LDY #$04
+L_9511
+         INY
+         LDA ($5E),Y
+         BNE L_9511
+         INY
+         TYA
+         ADC $5E
+         TAX
+         LDY #$00
+         STA ($5E),Y
+         LDA $5F
+         ADC #$00
+         INY
+         STA ($5E),Y
+         STX $5E
+         STA $5F
+         BCC L_94FE
+         LDX #$80
+         STX $33
+         JSR $FD6A
+         CPX #$EF
+         BCC L_9539
+         LDX #$EF
+L_9539
+         LDA #$00
+         STA $0200,X
+         TXA
+         BEQ L_954C
+L_9541
+         LDA $01FF,X
+         AND #$7F
+         STA $01FF,X
+         DEX
+         BNE L_9541
+L_954C
+         LDA #$00
+         LDX #$FF
+         LDY #$01
+         RTS
+         JSR $FD0C
+         AND #$7F
+         RTS
+         LDX $B8
+         DEX
+         LDY #$04
+         STY $13
+         BIT $D6
+         BPL L_956C
+         PLA
+         PLA
+         JSR $D665
+         JMP $D7D2
+L_956C
+         INX
+L_956D
+         LDA $0200,X
+         BIT $13
+         BVS L_9578
+         CMP #$20
+         BEQ L_956C
+L_9578
+         STA $0E
+         CMP #$22
+         BEQ L_95F2
+         BVS L_95CD
+         CMP #$3F
+         BNE L_9588
+         LDA #$BA
+         BNE L_95CD
+L_9588
+         CMP #$30
+         BCC L_9590
+         CMP #$3C
+         BCC L_95CD
+L_9590
+         STY $AD
+         LDA #$D0
+         STA $9D
+         LDA #$CF
+         STA $9E
+         LDY #$00
+         STY $0F
+         DEY
+         STX $B8
+         DEX
+L_95A2
+         INY
+         BNE L_95A7
+         INC $9E
+L_95A7
+         INX
+L_95A8
+         LDA $0200,X
+         CMP #$20
+         BEQ L_95A7
+         SEC
+         SBC ($9D),Y
+         BEQ L_95A2
+         CMP #$80
+         BNE L_95F9
+         ORA $0F
+         CMP #$C5                       ; key 'E' (stomp)
+         BNE L_95CB
+         LDA $0201,X
+         CMP #$4E
+         BEQ L_95F9
+         CMP #$4F
+         BEQ L_95F9
+         LDA #$C5
+L_95CB
+         LDY $AD
+L_95CD
+         INX
+         INY
+         STA $01FB,Y
+         LDA $01FB,Y
+         BEQ L_9610
+         SEC
+         SBC #$3A
+         BEQ L_95E0
+         CMP #$49
+         BNE L_95E2
+L_95E0
+         STA $13
+L_95E2
+         SEC
+         SBC #$78
+         BNE L_956D
+         STA $0E
+L_95E9
+         LDA $0200,X
+         BEQ L_95CD
+         CMP $0E
+         BEQ L_95CD
+L_95F2
+         INY
+         STA $01FB,Y
+         INX
+         BNE L_95E9
+L_95F9
+         LDX $B8
+         INC $0F
+L_95FD
+         LDA ($9D),Y
+         INY
+         BNE L_9604
+         INC $9E
+L_9604
+         ASL
+         BCC L_95FD
+         LDA ($9D),Y
+         BNE L_95A8
+         LDA $0200,X
+         BPL L_95CB
+L_9610
+         STA $01FD,Y
+         DEC $B9
+         LDA #$FF
+         STA $B8
+         RTS
+         LDA $67
+         LDX $68
+L_961E
+         LDY #$01
+         STA $9B
+         STX $9C
+         LDA ($9B),Y
+         BEQ L_9647
+         INY
+         INY
+         LDA $51
+         CMP ($9B),Y
+         BCC L_9648
+         BEQ L_9635
+         DEY
+         BNE L_963E
+L_9635
+         LDA $50
+         DEY
+         CMP ($9B),Y
+         BCC L_9648
+         BEQ L_9648
+L_963E
+         DEY
+         LDA ($9B),Y
+         TAX
+         DEY
+         LDA ($9B),Y
+         BCS L_961E
+L_9647
+         CLC
+L_9648
+         RTS
+         BNE L_9648
+         LDA #$00
+         STA $D6
+         TAY
+         STA ($67),Y
+         INY
+         STA ($67),Y
+         LDA $67
+         ADC #$02
+         STA $69
+         STA $AF
+         LDA $68
+         ADC #$00
+         STA $6A
+         STA $B0
+         JSR $D697
+         LDA #$00
+         BNE L_9696
+         LDA $73
+         LDY $74
+         STA $6F
+         STY $70
+         LDA $69
+         LDY $6A
+         STA $6B
+         STY $6C
+         STA $6D
+         STY $6E
+         JSR $D849
+         LDX #$55
+         STX $52
+         PLA
+         TAY
+         PLA
+         LDX #$F8
+         TXS
+         PHA
+         TYA
+         PHA
+         LDA #$00
+         STA $7A
+         STA $14
+L_9696
+         RTS
+         CLC
+         LDA $67
+         ADC #$FF
+         STA $B8
+         LDA $68
+         ADC #$FF
+         STA $B9
+         RTS
+         BCC L_96B1
+         BEQ L_96B1
+         CMP #$C9                       ; key 'I' (up)
+         BEQ L_96B1
+         CMP #$2C
+         BNE L_9696
+L_96B1
+         JSR $DA0C
+         JSR $D61A
+         JSR $00B7
+         BEQ L_96CC
+         CMP #$C9                       ; key 'I' (up)
+         BEQ L_96C4
+         CMP #$2C
+         BNE L_9648
+L_96C4
+         JSR $00B1
+         JSR $DA0C
+         BNE L_9696
+L_96CC
+         PLA
+         PLA
+         LDA $50
+         ORA $51
+         BNE L_96DA
+         LDA #$FF
+         STA $50
+         STA $51
+L_96DA
+         LDY #$01
+         LDA ($9B),Y
+         BEQ L_9724
+         JSR $D858
+         JSR $DAFB
+         INY
+         LDA ($9B),Y
+         TAX
+         INY
+         LDA ($9B),Y
+         CMP $51
+         BNE L_96F5
+         CPX $50
+         BEQ L_96F7
+L_96F5
+         BCS L_9724
+L_96F7
+         STY $85
+         JSR $ED24
+         LDA #$20
+L_96FE
+         LDY $85
+         AND #$7F
+L_9702
+         JSR $DB5C
+         LDA $24
+         CMP #$21
+         BCC L_9712
+         JSR $DAFB
+         LDA #$05
+         STA $24
+L_9712
+         INY
+         LDA ($9B),Y
+         BNE L_9734
+         TAY
+         LDA ($9B),Y
+         TAX
+         INY
+         LDA ($9B),Y
+         STX $9B
+         STA $9C
+         BNE L_96DA
+L_9724
+         LDA #$0D
+         JSR $DB5C
+         JMP $D7D2
+         INY
+         BNE L_9731
+         INC $9E
+L_9731
+         LDA ($9D),Y
+         RTS
+L_9734
+         BPL L_9702
+         SEC
+         SBC #$7F
+         TAX
+         STY $85
+         LDY #$D0
+         STY $9D
+         LDY #$CF
+         STY $9E
+         LDY #$FF
+L_9746
+         DEX
+         BEQ L_9750
+L_9749
+         JSR $D72C
+         BPL L_9749
+         BMI L_9746
+L_9750
+         LDA #$20
+         JSR $DB5C
+L_9755
+         JSR $D72C
+         BMI L_975F
+         JSR $DB5C
+         BNE L_9755
+L_975F
+         JSR $DB5C
+         LDA #$20
+         BNE L_96FE
+         LDA #$80
+         STA $14
+         JSR $DA46
+         JSR $D365
+         BNE L_9777
+         TXA
+         ADC #$0F
+         TAX
+         TXS
+L_9777
+         PLA
+         PLA
+         LDA #$09
+         JSR $D3D6
+         JSR $D9A3
+         CLC
+         TYA
+         ADC $B8
+         PHA
+         LDA $B9
+         ADC #$00
+         PHA
+         LDA $76
+         PHA
+         LDA $75
+         PHA
+         LDA #$C1
+         JSR $DEC0
+         JSR $DD6A
+         JSR $DD67
+         LDA $A2
+         ORA #$7F
+         AND $9E
+         STA $9E
+         LDA #$AF
+         LDY #$D7
+         STA $5E
+         STY $5F
+         JMP $DE20
+         LDA #$13
+         LDY #$E9
+         JSR $EAF9
+         JSR $00B7
+         CMP #$C7
+         BNE L_97C3
+         JSR $00B1
+         JSR $DD67
+L_97C3
+         JSR $EB82
+         JSR $DE15
+         LDA $86
+         PHA
+         LDA $85
+         PHA
+         LDA #$81
+         PHA
+         TSX
+         STX $F8
+         JSR $D858
+         LDA $B8
+         LDY $B9
+         LDX $76
+         INX
+         BEQ L_97E5
+         STA $79
+         STY $7A
+L_97E5
+         LDY #$00
+         LDA ($B8),Y
+         BNE L_9842
+         LDY #$02
+         LDA ($B8),Y
+         CLC
+         BEQ L_9826
+         INY
+         LDA ($B8),Y
+         STA $75
+         INY
+         LDA ($B8),Y
+         STA $76
+         TYA
+         ADC $B8
+         STA $B8
+         BCC L_9805
+         INC $B9
+L_9805
+         BIT $F2
+         BPL L_981D
+         LDX $76
+         INX
+         BEQ L_981D
+         LDA #$23
+         JSR $DB5C
+         LDX $75
+         LDA $76
+         JSR $ED24
+         JSR $DB57
+L_981D
+         JSR $00B1
+         JSR $D828
+         JMP $D7D2
+L_9826
+         BEQ L_988A
+         BEQ L_9857
+         SBC #$80
+         BCC L_983F
+         CMP #$40
+         BCS L_9846
+         ASL
+         TAY
+         LDA $D001,Y
+         PHA
+         LDA $D000,Y
+         PHA
+         JMP $00B1
+L_983F
+         JMP $DA46
+L_9842
+         CMP #$3A
+         BEQ L_9805
+L_9846
+         JMP $DEC9
+         SEC
+         LDA $67
+         SBC #$01
+         LDY $68
+         BCS L_9853
+         DEY
+L_9853
+         STA $7D
+         STY $7E
+L_9857
+         RTS
+         LDA $C000                      ; read keyboard
+         CMP #$83
+         BEQ L_9860
+         RTS
+L_9860
+         JSR $D553
+         LDX #$FF
+         BIT $D8
+         BPL L_986C
+         JMP $F2E9
+L_986C
+         CMP #$03
+         BCS L_9871
+         CLC
+L_9871
+         BNE L_98AF
+         LDA $B8
+         LDY $B9
+         LDX $76
+         INX
+         BEQ L_9888
+         STA $79
+         STY $7A
+         LDA $75
+         LDY $76
+         STA $77
+         STY $78
+L_9888
+         PLA
+         PLA
+L_988A
+         LDA #$5D
+         LDY #$D3
+         BCC L_9893
+         JMP $D431
+L_9893
+         JMP $D43C
+         BNE L_98AF
+         LDX #$D2
+         LDY $7A
+         BNE L_98A1
+         JMP $D412
+L_98A1
+         LDA $79
+         STA $B8
+         STY $B9
+         LDA $77
+         LDY $78
+         STA $75
+         STY $76
+L_98AF
+         RTS
+         SEC
+         LDA $AF
+         SBC $67
+         STA $50
+         LDA $B0
+         SBC $68
+         STA $51
+         JSR $D8F0
+         JSR $FECD
+         JSR $D901
+         JMP $FECD
+         JSR $D8F0
+         JSR $FEFD
+         CLC
+         LDA $67
+         ADC $50
+         STA $69
+         LDA $68
+         ADC $51
+         STA $6A
+         LDA $52
+         STA $D6
+         JSR $D901
+         JSR $FEFD
+         BIT $D6
+         BPL L_98ED
+         JMP $D665
+L_98ED
+         JMP $D4F2
+         LDA #$50
+         LDY #$00
+         STA $3C
+         STY $3D
+         LDA #$52
+         STA $3E
+         STY $3F
+         STY $D6
+         RTS
+         LDA $67
+         LDY $68
+         STA $3C
+         STY $3D
+         LDA $69
+         LDY $6A
+         STA $3E
+         STY $3F
+         RTS
+         PHP
+         DEC $76
+         PLP
+         BNE L_991B
+         JMP $D665
+L_991B
+         JSR $D66C
+         JMP $D935
+         LDA #$03
+         JSR $D3D6
+         LDA $B9
+         PHA
+         LDA $B8
+         PHA
+         LDA $76
+         PHA
+         LDA $75
+         PHA
+         LDA #$B0
+         PHA
+         JSR $00B7
+         JSR $D93E
+         JMP $D7D2
+         JSR $DA0C
+         JSR $D9A6
+         LDA $76
+         CMP $51
+         BCS L_9955
+         TYA
+         SEC
+         ADC $B8
+         LDX $B9
+         BCC L_9959
+         INX
+         BCS L_9959
+L_9955
+         LDA $67
+         LDX $68
+L_9959
+         JSR $D61E
+         BCC L_997C
+         LDA $9B
+         SBC #$01
+         STA $B8
+         LDA $9C
+         SBC #$00
+         STA $B9
+L_996A
+         RTS
+         BNE L_996A
+         LDA #$FF
+         STA $85
+         JSR $D365
+         TXS
+         CMP #$B0
+         BEQ L_9984
+         LDX #$16
+         BIT $5AA2
+         JMP $D412
+L_9981
+         JMP $DEC9
+L_9984
+         PLA
+         PLA
+         CPY #$42
+         BEQ L_99C5
+         STA $75
+         PLA
+         STA $76
+         PLA
+         STA $B8
+         PLA
+         STA $B9
+         JSR $D9A3
+L_9998
+         TYA
+         CLC
+         ADC $B8
+         STA $B8
+         BCC L_99A2
+         INC $B9
+L_99A2
+         RTS
+         LDX #$3A
+         BIT $00A2
+         STX $0D
+         LDY #$00
+         STY $0E
+L_99AE
+         LDA $0E
+         LDX $0D
+         STA $0D
+         STX $0E
+L_99B6
+         LDA ($B8),Y
+         BEQ L_99A2
+         CMP $0E
+         BEQ L_99A2
+         INY
+         CMP #$22
+         BNE L_99B6
+         BEQ L_99AE
+L_99C5
+         PLA
+         PLA
+         PLA
+         RTS
+         JSR $DD7B
+         JSR $00B7
+         CMP #$AB
+         BEQ L_99D8
+         LDA #$C4
+         JSR $DEC0
+L_99D8
+         LDA $9D
+         BNE L_99E1
+         JSR $D9A6
+         BEQ L_9998
+L_99E1
+         JSR $00B7
+         BCS L_99E9
+         JMP $D93E
+L_99E9
+         JMP $D828
+         JSR $E6F8
+         PHA
+         CMP #$B0
+         BEQ L_99F8
+L_99F4
+         CMP #$AB
+         BNE L_9981
+L_99F8
+         DEC $A1
+         BNE L_9A00
+         PLA
+         JMP $D82A
+L_9A00
+         JSR $00B1
+         JSR $DA0C
+         CMP #$2C
+         BEQ L_99F8
+         PLA
+L_9A0B
+         RTS
+         LDX #$00
+         STX $50
+         STX $51
+         BCS L_9A0B
+         SBC #$2F
+         STA $0D
+         LDA $51
+         STA $5E
+         CMP #$19
+         BCS L_99F4
+         LDA $50
+         ASL
+         ROL $5E
+         ASL
+         ROL $5E
+         ADC $50
+         STA $50
+         LDA $5E
+         ADC $51
+         STA $51
+         ASL $50
+         ROL $51
+         LDA $50
+         ADC $0D
+         STA $50
+         BCC L_9A40
+         INC $51
+L_9A40
+         JSR $00B1
+         JMP $DA12
+         JSR $DFE3
+         STA $85
+         STY $86
+         LDA #$D0
+         JSR $DEC0
+         LDA $12
+         PHA
+         LDA $11
+         PHA
+         JSR $DD7B
+         PLA
+         ROL
+         JSR $DD6D
+         BNE L_9A7A
+         PLA
+         BPL L_9A77
+         JSR $EB72
+         JSR $E10C
+         LDY #$00
+         LDA $A0
+         STA ($85),Y
+         INY
+         LDA $A1
+         STA ($85),Y
+         RTS
+L_9A77
+         JMP $EB27
+L_9A7A
+         PLA
+         LDY #$02
+         LDA ($A0),Y
+         CMP $70
+         BCC L_9A9A
+         BNE L_9A8C
+         DEY
+         LDA ($A0),Y
+         CMP $6F
+         BCC L_9A9A
+L_9A8C
+         LDY $A1
+         CPY $6A
+         BCC L_9A9A
+         BNE L_9AA1
+         LDA $A0
+         CMP $69
+         BCS L_9AA1
+L_9A9A
+         LDA $A0
+         LDY $A1
+         JMP $DAB7
+L_9AA1
+         LDY #$00
+         LDA ($A0),Y
+         JSR $E3D5
+         LDA $8C
+         LDY $8D
+         STA $AB
+         STY $AC
+         JSR $E5D4
+         LDA #$9D
+         LDY #$00
+         STA $8C
+         STY $8D
+         JSR $E635
+         LDY #$00
+         LDA ($8C),Y
+         STA ($85),Y
+         INY
+         LDA ($8C),Y
+         STA ($85),Y
+         INY
+         LDA ($8C),Y
+         STA ($85),Y
+         RTS
+L_9ACF
+         JSR $DB3D
+         JSR $00B7
+         BEQ L_9AFB
+         BEQ L_9B02
+         CMP #$C0
+         BEQ L_9B16
+         CMP #$C3
+         CLC
+         BEQ L_9B16
+         CMP #$2C
+         CLC
+         BEQ L_9B03
+         CMP #$3B
+         BEQ L_9B2F
+         JSR $DD7B
+         BIT $11
+         BMI L_9ACF
+         JSR $ED34
+         JSR $E3E7
+         JMP $DACF
+L_9AFB
+         LDA #$0D
+         JSR $DB5C
+         EOR #$FF
+L_9B02
+         RTS
+L_9B03
+         LDA $24
+         CMP #$18
+         BCC L_9B0E
+         JSR $DAFB
+         BNE L_9B2F
+L_9B0E
+         ADC #$10
+         AND #$F0
+         STA $24
+         BCC L_9B2F
+L_9B16
+         PHP
+         JSR $E6F5
+         CMP #$29
+         BEQ L_9B21
+         JMP $DEC9
+L_9B21
+         PLP
+         BCC L_9B2B
+         DEX
+         TXA
+         SBC $24
+         BCC L_9B2F
+         TAX
+L_9B2B
+         INX
+L_9B2C
+         DEX
+         BNE L_9B35
+L_9B2F
+         JSR $00B1
+         JMP $DAD7
+L_9B35
+         JSR $DB57
+         BNE L_9B2C
+         JSR $E3E7
+         JSR $E600
+         TAX
+         LDY #$00
+         INX
+L_9B44
+         DEX
+         BEQ L_9B02
+         LDA ($5E),Y
+         JSR $DB5C
+         INY
+         CMP #$0D
+         BNE L_9B44
+         JSR $DB00
+         JMP $DB44
+         LDA #$20
+         BIT $3FA9
+         ORA #$80
+         CMP #$A0
+         BCC L_9B64
+         ORA $F3
+L_9B64
+         JSR $FDED                      ; COUT (print character)
+         AND #$7F
+         PHA
+         LDA $F1
+         JSR $FCA8
+         PLA
+         RTS
+         LDA $15
+         BEQ L_9B87
+         BMI L_9B7B
+         LDY #$FF
+         BNE L_9B7F
+L_9B7B
+         LDA $7B
+         LDY $7C
+L_9B7F
+         STA $75
+         STY $76
+         JMP $DEC9
+         HEX 68
+L_9B87
+         BIT $D8
+         BPL L_9B90
+         LDX #$FE
+         JMP $F2E9
+L_9B90
+         LDA #$EF
+         LDY #$DC
+         JSR $DB3A
+         LDA $79
+         LDY $7A
+         STA $B8
+         STY $B9
+         RTS
+         JSR $E306
+         LDX #$01
+         LDY #$02
+         LDA #$00
+         STA $0201
+         LDA #$40
+         JSR $DBEB
+         RTS
+         CMP #$22
+         BNE L_9BC4
+         JSR $DE81
+         LDA #$3B
+         JSR $DEC0
+         JSR $DB3D
+         JMP $DBC7
+L_9BC4
+         JSR $DB5A
+         JSR $E306
+         LDA #$2C
+         STA $01FF
+         JSR $D52C
+         LDA $0200
+         CMP #$03
+         BNE L_9BE9
+         JMP $D863
+         JSR $DB5A
+         JMP $D52C
+         LDX $7D
+         LDY $7E
+         LDA #$98
+         BIT $00A9
+         STA $15
+         STX $7F
+         STY $80
+         JSR $DFE3
+         STA $85
+         STY $86
+         LDA $B8
+         LDY $B9
+         STA $87
+         STY $88
+         LDX $7F
+         LDY $80
+         STX $B8
+         STY $B9
+         JSR $00B7
+         BNE L_9C2B
+         BIT $15
+         BVC L_9C1F
+         JSR $FD0C
+         AND #$7F
+         STA $0200
+         LDX #$FF
+         LDY #$01
+         BNE L_9C27
+L_9C1F
+         BMI L_9CA0
+         JSR $DB5A
+         JSR $DBDC
+L_9C27
+         STX $B8
+         STY $B9
+L_9C2B
+         JSR $00B1
+         BIT $11
+         BPL L_9C63
+         BIT $15
+         BVC L_9C3F
+         INX
+         STX $B8
+         LDA #$00
+         STA $0D
+         BEQ L_9C4B
+L_9C3F
+         STA $0D
+         CMP #$22
+         BEQ L_9C4C
+         LDA #$3A
+         STA $0D
+         LDA #$2C
+L_9C4B
+         CLC
+L_9C4C
+         STA $0E
+         LDA $B8
+         LDY $B9
+         ADC #$00
+         BCC L_9C57
+         INY
+L_9C57
+         JSR $E3ED
+         JSR $E73D
+         JSR $DA7B
+         JMP $DC72
+L_9C63
+         PHA
+         LDA $0200
+         BEQ L_9C99
+L_9C69
+         PLA
+         JSR $EC4A
+         LDA $12
+         JSR $DA63
+         JSR $00B7
+         BEQ L_9C7E
+         CMP #$2C
+         BEQ L_9C7E
+         JMP $DB71
+L_9C7E
+         LDA $B8
+         LDY $B9
+         STA $7F
+         STY $80
+         LDA $87
+         LDY $88
+         STA $B8
+         STY $B9
+         JSR $00B7
+         BEQ L_9CC6
+         JSR $DEBE
+         JMP $DBF1
+L_9C99
+         LDA $15
+         BNE L_9C69
+         JMP $DB86
+L_9CA0
+         JSR $D9A3
+         INY
+         TAX
+         BNE L_9CB9
+         LDX #$2A
+         INY
+         LDA ($B8),Y
+         BEQ L_9D0D
+         INY
+         LDA ($B8),Y
+         STA $7B
+         INY
+         LDA ($B8),Y
+         INY
+         STA $7C
+L_9CB9
+         LDA ($B8),Y
+         TAX
+         JSR $D998
+         CPX #$83
+         BNE L_9CA0
+         JMP $DC2B
+L_9CC6
+         LDA $7F
+         LDY $80
+         LDX $15
+         BPL L_9CD1
+         JMP $D853
+L_9CD1
+         LDY #$00
+         LDA ($7F),Y
+         BEQ L_9CDE
+         LDA #$DF
+         LDY #$DC
+         JMP $DB3A
+L_9CDE
+         RTS
+         HEX 3F45585452
+         EOR ($20,X)
+         EOR #$47
+         LSR $524F
+         EOR $44
+         ORA $3F00
+         HEX 52
+         EOR $45
+         LSR $4554
+         HEX 52
+         ORA $D000
+         HEX 04
+         LDY #$00
+         BEQ L_9D02
+         JSR $DFE3
+L_9D02
+         STA $85
+         STY $86
+         JSR $D365
+         BEQ L_9D0F
+         LDX #$00
+L_9D0D
+         BEQ L_9D78
+L_9D0F
+         TXS
+         INX
+         INX
+         INX
+         INX
+         TXA
+         INX
+         INX
+         INX
+         INX
+         INX
+         INX
+         STX $60
+         LDY #$01
+         JSR $EAF9
+         TSX
+         LDA $0109,X
+         STA $A2
+         LDA $85
+         LDY $86
+         JSR $E7BE
+         JSR $EB27
+         LDY #$01
+         JSR $EBB4
+         TSX
+         SEC
+         SBC $0109,X
+         BEQ L_9D55
+         LDA $010F,X
+         STA $75
+         LDA $0110,X
+         STA $76
+         LDA $0112,X
+         STA $B8
+         LDA $0111,X
+         STA $B9
+L_9D52
+         JMP $D7D2
+L_9D55
+         TXA
+         ADC #$11
+         TAX
+         TXS
+         JSR $00B7
+         CMP #$2C
+         BNE L_9D52
+         JSR $00B1
+         JSR $DCFF
+         JSR $DD7B
+         CLC
+         BIT $38
+         BIT $11
+         BMI L_9D74
+         BCS L_9D76
+L_9D73
+         RTS
+L_9D74
+         BCS L_9D73
+L_9D76
+         LDX #$A3
+L_9D78
+         JMP $D412
+         LDX $B8
+         BNE L_9D81
+         DEC $B9
+L_9D81
+         DEC $B8
+         LDX #$00
+         BIT $48
+         TXA
+         PHA
+         LDA #$01
+         JSR $D3D6
+         JSR $DE60
+         LDA #$00
+         STA $89
+         JSR $00B7
+         SEC
+         SBC #$CF
+         BCC L_9DB4
+         CMP #$03
+         BCS L_9DB4
+         CMP #$01
+         ROL
+         EOR #$01
+         EOR $89
+         CMP $89
+         BCC L_9E0D
+         STA $89
+         JSR $00B1
+         JMP $DD98
+L_9DB4
+         LDX $89
+         BNE L_9DE4
+         BCS L_9E35
+         ADC #$07
+         BCC L_9E35
+         ADC $11
+         BNE L_9DC5
+         JMP $E597
+L_9DC5
+         ADC #$FF
+         STA $5E
+         ASL
+         ADC $5E
+         TAY
+L_9DCD
+         PLA
+         CMP $D0B2,Y
+         BCS L_9E3A
+         JSR $DD6A
+L_9DD6
+         PHA
+         JSR $DDFD
+         PLA
+         LDY $87
+         BPL L_9DF6
+         TAX
+         BEQ L_9E38
+         BNE L_9E43
+L_9DE4
+         LSR $11
+         TXA
+         ROL
+         LDX $B8
+         BNE L_9DEE
+         DEC $B9
+L_9DEE
+         DEC $B8
+         LDY #$1B
+         STA $89
+         BNE L_9DCD
+L_9DF6
+         CMP $D0B2,Y
+         BCS L_9E43
+         BCC L_9DD6
+         LDA $D0B4,Y
+         PHA
+         LDA $D0B3,Y
+         PHA
+         JSR $DE10
+         LDA $89
+         JMP $DD86
+L_9E0D
+         JMP $DEC9
+         LDA $A2
+         LDX $D0B2,Y
+         TAY
+         PLA
+         STA $5E
+         INC $5E
+         PLA
+         STA $5F
+         TYA
+         PHA
+         JSR $EB72
+         LDA $A1
+         PHA
+         LDA $A0
+         PHA
+         LDA $9F
+         PHA
+         LDA $9E
+         PHA
+         LDA $9D
+         PHA
+         JMP ($005E)
+L_9E35
+         LDY #$FF
+         PLA
+L_9E38
+         BEQ L_9E5D
+L_9E3A
+         CMP #$64
+         BEQ L_9E41
+         JSR $DD6A
+L_9E41
+         STY $87
+L_9E43
+         PLA
+         LSR
+         STA $16
+         PLA
+         STA $A5
+         PLA
+         STA $A6
+         PLA
+         STA $A7
+         PLA
+         STA $A8
+         PLA
+         STA $A9
+         PLA
+         STA $AA
+         EOR $A2
+         STA $AB
+L_9E5D
+         LDA $9D
+         RTS
+         LDA #$00
+         STA $11
+L_9E64
+         JSR $00B1
+         BCS L_9E6C
+L_9E69
+         JMP $EC4A
+L_9E6C
+         JSR $E07D
+         BCS L_9ED5
+         CMP #$2E
+         BEQ L_9E69
+         CMP #$C9                       ; key 'I' (up)
+         BEQ L_9ECE
+         CMP #$C8
+         BEQ L_9E64
+         CMP #$22
+         BNE L_9E90
+         LDA $B8
+         LDY $B9
+         ADC #$00
+         BCC L_9E8A
+         INY
+L_9E8A
+         JSR $E3E7
+         JMP $E73D
+L_9E90
+         CMP #$C6
+         BNE L_9EA4
+         LDY #$18
+         BNE L_9ED0
+         LDA $9D
+         BNE L_9E9F
+         LDY #$01
+         BIT $00A0
+         JMP $E301
+L_9EA4
+         CMP #$C2
+         BNE L_9EAB
+         JMP $E354
+L_9EAB
+         CMP #$D2
+         BCC L_9EB2
+         JMP $DF0C
+L_9EB2
+         JSR $DEBB
+         JSR $DD7B
+         LDA #$29
+         BIT $28A9
+         BIT $2CA9
+         LDY #$00
+         CMP ($B8),Y
+         BNE L_9EC9
+         JMP $00B1
+L_9EC9
+         LDX #$10
+         JMP $D412
+L_9ECE
+         LDY #$15
+L_9ED0
+         PLA
+         PLA
+         JMP $DDD7
+L_9ED5
+         JSR $DFE3
+         STA $A0
+         STY $A1
+         LDX $11
+         BEQ L_9EE5
+         LDX #$00
+         STX $AC
+         RTS
+L_9EE5
+         LDX $12
+         BPL L_9EF6
+         LDY #$00
+         LDA ($A0),Y
+         TAX
+         INY
+         LDA ($A0),Y
+         TAY
+         TXA
+         JMP $E2F2
+L_9EF6
+         JMP $EAF9
+L_9EF9
+         JSR $00B1
+         JSR $F1EC
+         TXA
+         LDY $F0
+         JSR $F871
+         TAY
+         JSR $E301
+         JMP $DEB8
+         CMP #$D7
+         BEQ L_9EF9
+         ASL
+         PHA
+         TAX
+         JSR $00B1
+         CPX #$CF
+         BCC L_9F3A
+         JSR $DEBB
+         JSR $DD7B
+         JSR $DEBE
+         JSR $DD6C
+         PLA
+         TAX
+         LDA $A1
+         PHA
+         LDA $A0
+         PHA
+         TXA
+         PHA
+         JSR $E6F8
+         PLA
+         TAY
+         TXA
+         PHA
+         JMP $DF3F
+L_9F3A
+         JSR $DEB2
+         PLA
+         TAY
+         LDA $CFDC,Y
+         STA $91
+         LDA $CFDD,Y
+         STA $92
+         JSR $0090
+         JMP $DD6A
+         LDA $A5
+         ORA $9D
+         BNE L_9F60
+         LDA $A5
+         BEQ L_9F5D
+         LDA $9D
+         BNE L_9F60
+L_9F5D
+         LDY #$00
+         BIT $01A0
+         JMP $E301
+         JSR $DD6D
+         BCS L_9F7D
+         LDA $AA
+         ORA #$7F
+         AND $A6
+         STA $A6
+         LDA #$A5
+         LDY #$00
+         JSR $EBB2
+         TAX
+         JMP $DFB0
+L_9F7D
+         LDA #$00
+         STA $11
+         DEC $89
+         JSR $E600
+         STA $9D
+         STX $9E
+         STY $9F
+         LDA $A8
+         LDY $A9
+         JSR $E604
+         STX $A8
+         STY $A9
+         TAX
+         SEC
+         SBC $9D
+         BEQ L_9FA5
+         LDA #$01
+         BCC L_9FA5
+         LDX $9D
+         LDA #$FF
+L_9FA5
+         STA $A2
+         LDY #$FF
+         INX
+L_9FAA
+         INY
+         DEX
+         BNE L_9FB5
+         LDX $A2
+         BMI L_9FC1
+         CLC
+         BCC L_9FC1
+L_9FB5
+         LDA ($A8),Y
+         CMP ($9E),Y
+         BEQ L_9FAA
+         LDX #$FF
+         BCS L_9FC1
+         LDX #$01
+L_9FC1
+         INX
+         TXA
+         ROL
+         AND $16
+         BEQ L_9FCA
+         LDA #$01
+L_9FCA
+         JMP $EB93
+         JSR $E6FB
+         JSR $FB1E
+         JMP $E301
+L_9FD6
+         JSR $DEBE
+         TAX
+         JSR $DFE8
+         JSR $00B7
+         BNE L_9FD6
+         RTS
+         LDX #$00
+         JSR $00B7
+         STX $10
+         STA $81
+         JSR $00B7
+         JSR $E07D
+         BCS L_9FF7
+L_9FF4
+         JMP $DEC9
+L_9FF7
+         LDX #$00
+         STX $11
+         STX $12
+         JMP $E007
+         JMP $F128
+         JMP $D43C
+         HEX 00
+         JSR $00B1
+         BCC L_A011
+         JSR $E07D
+         BCC L_A01C
+L_A011
+         TAX
+L_A012
+         JSR $00B1
+         BCC L_A012
+         JSR $E07D
+         BCS L_A012
+L_A01C
+         CMP #$24
+         BNE L_A026
+         LDA #$FF
+         STA $11
+         BNE L_A036
+L_A026
+         CMP #$25
+         BNE L_A03D
+         LDA $14
+         BMI L_9FF4
+         LDA #$80
+         STA $12
+         ORA $81
+         STA $81
+L_A036
+         TXA
+         ORA #$80
+         TAX
+         JSR $00B1
+L_A03D
+         STX $82
+         SEC
+SUB_A040
+         ORA $14
+         SBC #$28
+         BNE L_A049
+L_A046
+         JMP $E11E
+L_A049
+         BIT $14
+         BMI L_A04F
+         BVS L_A046
+L_A04F
+         LDA #$00
+         STA $14
+         LDA $69
+         LDX $6A
+         LDY #$00
+L_A059
+         STX $9C
+L_A05B
+         STA $9B
+         CPX $6C
+         BNE L_A065
+         CMP $6B
+         BEQ L_A087
+L_A065
+         LDA $81
+         CMP ($9B),Y
+         BNE L_A073
+         LDA $82
+         INY
+         CMP ($9B),Y
+         BEQ L_A0DE
+         DEY
+L_A073
+         CLC
+         LDA $9B
+         ADC #$07
+         BCC L_A05B
+         INX
+         BNE L_A059
+         CMP #$41
+         BCC L_A086
+         SBC #$5B
+         SEC
+         SBC #$A5
+L_A086
+         RTS
+L_A087
+         PLA
+         PHA
+         CMP #$D7
+         BNE L_A09C
+         TSX
+         LDA $0102,X
+         CMP #$DE
+         BNE L_A09C
+         LDA #$9A
+         LDY #$E0
+         RTS
+         HEX 0000
+L_A09C
+         LDA $6B
+         LDY $6C
+         STA $9B
+         STY $9C
+         LDA $6D
+         LDY $6E
+         STA $96
+         STY $97
+         CLC
+         ADC #$07
+         BCC L_A0B2
+         INY
+L_A0B2
+         STA $94
+         STY $95
+         JSR $D393
+         LDA $94
+         LDY $95
+         INY
+         STA $6B
+         STY $6C
+         LDY #$00
+         LDA $81
+         STA ($9B),Y
+         INY
+         LDA $82
+         STA ($9B),Y
+         LDA #$00
+         INY
+         STA ($9B),Y
+         INY
+         STA ($9B),Y
+         INY
+         STA ($9B),Y
+         INY
+         STA ($9B),Y
+         INY
+         STA ($9B),Y
+L_A0DE
+         LDA $9B
+         CLC
+         ADC #$02
+         LDY $9C
+         BCC L_A0E8
+         INY
+L_A0E8
+         STA $83
+         STY $84
+         RTS
+         LDA $0F
+         ASL
+         ADC #$05
+         ADC $9B
+         LDY $9C
+         BCC L_A0F9
+         INY
+L_A0F9
+         STA $94
+         STY $95
+         RTS
+         BCC L_A080
+         BRK
+         HEX 00
+         JSR $00B1
+         JSR $DD67
+         LDA $A2
+         BMI L_A119
+         LDA $9D
+         CMP #$90
+         BCC L_A11B
+         LDA #$FE
+         LDY #$E0
+         JSR $EBB2
+L_A119
+         BNE L_A199
+L_A11B
+         JMP $EBF2
+         LDA $14
+         BNE L_A169
+         LDA $10
+         ORA $12
+         PHA
+         LDA $11
+         PHA
+         LDY #$00
+L_A12C
+         TYA
+         PHA
+         LDA $82
+         PHA
+         LDA $81
+         PHA
+         JSR $E102
+         PLA
+         STA $81
+         PLA
+         STA $82
+         PLA
+         TAY
+         TSX
+         LDA $0102,X
+         PHA
+         LDA $0101,X
+         PHA
+         LDA $A0
+         STA $0102,X
+         LDA $A1
+         STA $0101,X
+         INY
+         JSR $00B7
+         CMP #$2C
+         BEQ L_A12C
+         STY $0F
+         JSR $DEB8
+         PLA
+         STA $11
+         PLA
+         STA $12
+         AND #$7F
+         STA $10
+L_A169
+         LDX $6B
+         LDA $6C
+L_A16D
+         STX $9B
+         STA $9C
+         CMP $6E
+         BNE L_A179
+         CPX $6D
+         BEQ L_A1B8
+L_A179
+         LDY #$00
+         LDA ($9B),Y
+         INY
+         CMP $81
+         BNE L_A188
+         LDA $82
+         CMP ($9B),Y
+         BEQ L_A19E
+L_A188
+         INY
+         LDA ($9B),Y
+         CLC
+         ADC $9B
+         TAX
+         INY
+         LDA ($9B),Y
+         ADC $9C
+         BCC L_A16D
+L_A196
+         LDX #$6B
+         BIT $35A2
+L_A19B
+         JMP $D412
+L_A19E
+         LDX #$78
+         LDA $10
+         BNE L_A19B
+         LDA $14
+         BEQ L_A1AA
+         SEC
+         RTS
+L_A1AA
+         JSR $E0ED
+         LDA $0F
+         LDY #$04
+         CMP ($9B),Y
+         BNE L_A196
+         JMP $E24B
+L_A1B8
+         LDA $14
+         BEQ L_A1C1
+         LDX #$2A
+         JMP $D412
+L_A1C1
+         JSR $E0ED
+         JSR $D3E3
+         LDA #$00
+         TAY
+         STA $AE
+         LDX #$05
+         LDA $81
+         STA ($9B),Y
+         BPL L_A1D5
+         DEX
+L_A1D5
+         INY
+         LDA $82
+         STA ($9B),Y
+         BPL L_A1DE
+         DEX
+         DEX
+L_A1DE
+         STX $AD
+         LDA $0F
+         INY
+         INY
+         INY
+         STA ($9B),Y
+L_A1E7
+         LDX #$0B
+         LDA #$00
+         BIT $10
+         BVC L_A1F7
+         PLA
+         CLC
+         ADC #$01
+         TAX
+         PLA
+         ADC #$00
+L_A1F7
+         INY
+         STA ($9B),Y
+         INY
+         TXA
+         STA ($9B),Y
+         JSR $E2AD
+         STX $AD
+         STA $AE
+         LDY $5E
+         DEC $0F
+         BNE L_A1E7
+         ADC $95
+         BCS L_A26C
+         STA $95
+         TAY
+         TXA
+         ADC $94
+         BCC L_A21A
+         INY
+         BEQ L_A26C
+L_A21A
+         JSR $D3E3
+         STA $6D
+         STY $6E
+         LDA #$00
+         INC $AE
+         LDY $AD
+         BEQ L_A22E
+L_A229
+         DEY
+         STA ($94),Y
+         BNE L_A229
+L_A22E
+         DEC $95
+         DEC $AE
+         BNE L_A229
+         INC $95
+         SEC
+         LDA $6D
+         SBC $9B
+         LDY #$02
+         STA ($9B),Y
+         LDA $6E
+         INY
+         SBC $9C
+         STA ($9B),Y
+         LDA $10
+         BNE L_A2AC
+         INY
+         LDA ($9B),Y
+         STA $0F
+         LDA #$00
+         STA $AD
+L_A253
+         STA $AE
+         INY
+         PLA
+         TAX
+         STA $A0
+         PLA
+         STA $A1
+         CMP ($9B),Y
+         BCC L_A26F
+         BNE L_A269
+         INY
+         TXA
+         CMP ($9B),Y
+         BCC L_A270
+L_A269
+         JMP $E196
+L_A26C
+         JMP $D410
+L_A26F
+         INY
+L_A270
+         LDA $AE
+         ORA $AD
+         CLC
+         BEQ L_A281
+         JSR $E2AD
+         TXA
+         ADC $A0
+         TAX
+         TYA
+         LDY $5E
+L_A281
+         ADC $A1
+         STX $AD
+         DEC $0F
+         BNE L_A253
+         STA $AE
+         LDX #$05
+         LDA $81
+         BPL L_A292
+         DEX
+L_A292
+         LDA $82
+         BPL L_A298
+         DEX
+         DEX
+L_A298
+         STX $64
+         LDA #$00
+         JSR $E2B6
+         TXA
+         ADC $94
+         STA $83
+         TYA
+         ADC $95
+         STA $84
+         TAY
+         LDA $83
+L_A2AC
+         RTS
+         STY $5E
+         LDA ($9B),Y
+         STA $64
+         DEY
+         LDA ($9B),Y
+         STA $65
+         LDA #$10
+         STA $99
+         LDX #$00
+         LDY #$00
+L_A2C0
+         TXA
+         ASL
+         TAX
+         TYA
+         ROL
+         TAY
+         BCS L_A26C
+         ASL $AD
+         ROL $AE
+         BCC L_A2D9
+         CLC
+         TXA
+         ADC $64
+         TAX
+         TYA
+         ADC $65
+         TAY
+         BCS L_A26C
+L_A2D9
+         DEC $99
+         BNE L_A2C0
+         RTS
+         LDA $11
+         BEQ L_A2E5
+         JSR $E600
+L_A2E5
+         JSR $E484
+         SEC
+         LDA $6F
+         SBC $6D
+         TAY
+         LDA $70
+         SBC $6E
+L_A2F2
+         LDX #$00
+         STX $11
+         STA $9E
+         STY $9F
+         LDX #$90
+         JMP $EB9B
+         LDY $24
+         LDA #$00
+         SEC
+         BEQ L_A2F2
+         LDX $76
+         INX
+         BNE L_A2AC
+         LDX #$95
+         BIT $E0A2
+         JMP $D412
+         JSR $E341
+         JSR $E306
+         JSR $DEBB
+         LDA #$80
+         STA $14
+         JSR $DFE3
+         JSR $DD6A
+         JSR $DEB8
+         LDA #$D0
+         JSR $DEC0
+         PHA
+         LDA $84
+         PHA
+         LDA $83
+         PHA
+         LDA $B9
+         PHA
+         LDA $B8
+         PHA
+         JSR $D995
+         JMP $E3AF
+         LDA #$C2
+         JSR $DEC0
+         ORA #$80
+         STA $14
+         JSR $DFEA
+         STA $8A
+         STY $8B
+         JMP $DD6A
+         JSR $E341
+         LDA $8B
+         PHA
+         LDA $8A
+         PHA
+         JSR $DEB2
+         JSR $DD6A
+         PLA
+         STA $8A
+         PLA
+         STA $8B
+         LDY #$02
+         LDA ($8A),Y
+         STA $83
+         TAX
+         INY
+         LDA ($8A),Y
+         BEQ L_A30E
+         STA $84
+         INY
+L_A378
+         LDA ($83),Y
+         PHA
+         DEY
+         BPL L_A378
+         LDY $84
+         JSR $EB2B
+         LDA $B9
+         PHA
+         LDA $B8
+         PHA
+         LDA ($8A),Y
+         STA $B8
+         INY
+         LDA ($8A),Y
+         STA $B9
+         LDA $84
+         PHA
+         LDA $83
+         PHA
+         JSR $DD67
+         PLA
+         STA $8A
+         PLA
+         STA $8B
+         JSR $00B7
+         BEQ L_A3A9
+         JMP $DEC9
+L_A3A9
+         PLA
+         STA $B8
+         PLA
+         STA $B9
+         LDY #$00
+         PLA
+         STA ($8A),Y
+         PLA
+         INY
+         STA ($8A),Y
+         PLA
+         INY
+         STA ($8A),Y
+         PLA
+         INY
+         STA ($8A),Y
+         PLA
+         INY
+         STA ($8A),Y
+         RTS
+         JSR $DD6A
+         LDY #$00
+         JSR $ED36
+         PLA
+         PLA
+         LDA #$FF
+         LDY #$00
+         BEQ L_A3E7
+         LDX $A0
+         LDY $A1
+         STX $8C
+         STY $8D
+         JSR $E452
+         STX $9E
+         STY $9F
+         STA $9D
+         RTS
+L_A3E7
+         LDX #$22
+         STX $0D
+         STX $0E
+         STA $AB
+         STY $AC
+         STA $9E
+         STY $9F
+         LDY #$FF
+L_A3F7
+         INY
+         LDA ($AB),Y
+         BEQ L_A408
+         CMP $0D
+         BEQ L_A404
+         CMP $0E
+         BNE L_A3F7
+L_A404
+         CMP #$22
+         BEQ L_A409
+L_A408
+         CLC
+L_A409
+         STY $9D
+         TYA
+         ADC $AB
+         STA $AD
+         LDX $AC
+         BCC L_A415
+         INX
+L_A415
+         STX $AE
+         LDA $AC
+         BEQ L_A41F
+         CMP #$02
+         BNE L_A42A
+L_A41F
+         TYA
+         JSR $E3D5
+         LDX $AB
+         LDY $AC
+         JSR $E5E2
+L_A42A
+         LDX $52
+         CPX #$5E
+         BNE L_A435
+         LDX #$BF
+L_A432
+         JMP $D412
+L_A435
+         LDA $9D
+         STA $00,X
+         LDA $9E
+         STA $01,X
+         LDA $9F
+         STA $02,X
+         LDY #$00
+         STX $A0
+         STY $A1
+         DEY
+         STY $11
+         STX $53
+         INX
+         INX
+         INX
+         STX $52
+         RTS
+         LSR $13
+L_A454
+         PHA
+         EOR #$FF
+         SEC
+         ADC $6F
+         LDY $70
+         BCS L_A45F
+         DEY
+L_A45F
+         CPY $6E
+         BCC L_A474
+         BNE L_A469
+         CMP $6D
+         BCC L_A474
+L_A469
+         STA $6F
+         STY $70
+         STA $71
+         STY $72
+         TAX
+         PLA
+         RTS
+L_A474
+         LDX #$4D
+         LDA $13
+         BMI L_A432
+         JSR $E484
+         LDA #$80
+         STA $13
+         PLA
+         BNE L_A454
+         LDX $73
+         LDA $74
+         STX $6F
+         STA $70
+         LDY #$00
+         STY $8B
+         LDA $6D
+         LDX $6E
+         STA $9B
+         STX $9C
+         LDA #$55
+         LDX #$00
+         STA $5E
+         STX $5F
+L_A4A0
+         CMP $52
+         BEQ L_A4A9
+         JSR $E523
+         BEQ L_A4A0
+L_A4A9
+         LDA #$07
+         STA $8F
+         LDA $69
+         LDX $6A
+         STA $5E
+         STX $5F
+L_A4B5
+         CPX $6C
+         BNE L_A4BD
+         CMP $6B
+         BEQ L_A4C2
+L_A4BD
+         JSR $E519
+         BEQ L_A4B5
+L_A4C2
+         STA $94
+         STX $95
+         LDA #$03
+         STA $8F
+L_A4CA
+         LDA $94
+         LDX $95
+L_A4CE
+         CPX $6E
+         BNE L_A4D9
+         CMP $6D
+         BNE L_A4D9
+         JMP $E562
+L_A4D9
+         STA $5E
+         STX $5F
+         LDY #$00
+         LDA ($5E),Y
+         TAX
+         INY
+         LDA ($5E),Y
+         PHP
+         INY
+         LDA ($5E),Y
+         ADC $94
+         STA $94
+         INY
+         LDA ($5E),Y
+         ADC $95
+         STA $95
+         PLP
+         BPL L_A4CA
+         TXA
+         BMI L_A4CA
+         INY
+         LDA ($5E),Y
+         LDY #$00
+         ASL
+         ADC #$05
+         ADC $5E
+         STA $5E
+         BCC L_A50A
+         INC $5F
+L_A50A
+         LDX $5F
+L_A50C
+         CPX $95
+         BNE L_A514
+         CMP $94
+         BEQ L_A4CE
+L_A514
+         JSR $E523
+         BEQ L_A50C
+         LDA ($5E),Y
+         BMI L_A552
+         INY
+         LDA ($5E),Y
+         BPL L_A552
+         INY
+         LDA ($5E),Y
+         BEQ L_A552
+         INY
+         LDA ($5E),Y
+         TAX
+         INY
+         LDA ($5E),Y
+         CMP $70
+         BCC L_A538
+         BNE L_A552
+         CPX $6F
+         BCS L_A552
+L_A538
+         CMP $9C
+         BCC L_A552
+         BNE L_A542
+         CPX $9B
+         BCC L_A552
+L_A542
+         STX $9B
+         STA $9C
+         LDA $5E
+         LDX $5F
+         STA $8A
+         STX $8B
+         LDA $8F
+         STA $91
+L_A552
+         LDA $8F
+         CLC
+         ADC $5E
+         STA $5E
+         BCC L_A55D
+         INC $5F
+L_A55D
+         LDX $5F
+         LDY #$00
+         RTS
+         LDX $8B
+         BEQ L_A55D
+         LDA $91
+         AND #$04
+         LSR
+         TAY
+         STA $91
+         LDA ($8A),Y
+         ADC $9B
+         STA $96
+         LDA $9C
+         ADC #$00
+         STA $97
+         LDA $6F
+         LDX $70
+         STA $94
+         STX $95
+         JSR $D39A
+         LDY $91
+         INY
+         LDA $94
+         STA ($8A),Y
+         TAX
+         INC $95
+         LDA $95
+         INY
+         STA ($8A),Y
+         JMP $E488
+         LDA $A1
+         PHA
+         LDA $A0
+         PHA
+         JSR $DE60
+         JSR $DD6C
+         PLA
+         STA $AB
+         PLA
+         STA $AC
+         LDY #$00
+         LDA ($AB),Y
+         CLC
+         ADC ($A0),Y
+         BCC L_A5B7
+         LDX #$B0
+         JMP $D412
+L_A5B7
+         JSR $E3D5
+         JSR $E5D4
+         LDA $8C
+         LDY $8D
+         JSR $E604
+         JSR $E5E6
+         LDA $AB
+         LDY $AC
+         JSR $E604
+         JSR $E42A
+         JMP $DD95
+         LDY #$00
+         LDA ($AB),Y
+         PHA
+         INY
+         LDA ($AB),Y
+         TAX
+         INY
+         LDA ($AB),Y
+         TAY
+         PLA
+         STX $5E
+         STY $5F
+         TAY
+         BEQ L_A5F3
+         PHA
+L_A5EA
+         DEY
+         LDA ($5E),Y
+         STA ($71),Y
+         TYA
+         BNE L_A5EA
+         PLA
+L_A5F3
+         CLC
+         ADC $71
+         STA $71
+         BCC L_A5FC
+         INC $72
+L_A5FC
+         RTS
+         JSR $DD6C
+         LDA $A0
+         LDY $A1
+         STA $5E
+         STY $5F
+         JSR $E635
+         PHP
+         LDY #$00
+         LDA ($5E),Y
+         PHA
+         INY
+         LDA ($5E),Y
+         TAX
+         INY
+         LDA ($5E),Y
+         TAY
+         PLA
+         PLP
+         BNE L_A630
+         CPY $70
+         BNE L_A630
+         CPX $6F
+         BNE L_A630
+         PHA
+         CLC
+         ADC $6F
+         STA $6F
+         BCC L_A62F
+         INC $70
+L_A62F
+         PLA
+L_A630
+         STX $5E
+         STY $5F
+         RTS
+         CPY $54
+         BNE L_A645
+         CMP $53
+         BNE L_A645
+         STA $52
+         SBC #$03
+         STA $53
+         LDY #$00
+L_A645
+         RTS
+         JSR $E6FB
+         TXA
+         PHA
+         LDA #$01
+         JSR $E3DD
+         PLA
+         LDY #$00
+         STA ($9E),Y
+         PLA
+         PLA
+         JMP $E42A
+         JSR $E6B9
+         CMP ($8C),Y
+         TYA
+         BCC L_A666
+         LDA ($8C),Y
+         TAX
+         TYA
+L_A666
+         PHA
+L_A667
+         TXA
+L_A668
+         PHA
+         JSR $E3DD
+         LDA $8C
+         LDY $8D
+         JSR $E604
+         PLA
+         TAY
+         PLA
+         CLC
+         ADC $5E
+         STA $5E
+         BCC L_A67F
+         INC $5F
+L_A67F
+         TYA
+         JSR $E5E6
+         JMP $E42A
+         JSR $E6B9
+         CLC
+         SBC ($8C),Y
+         EOR #$FF
+         JMP $E660
+         LDA #$FF
+         STA $A1
+         JSR $00B7
+         CMP #$29
+         BEQ L_A6A2
+         JSR $DEBE
+         JSR $E6F8
+L_A6A2
+         JSR $E6B9
+         DEX
+         TXA
+         PHA
+         CLC
+         LDX #$00
+         SBC ($8C),Y
+         BCS L_A667
+         EOR #$FF
+         CMP $A1
+         BCC L_A668
+         LDA $A1
+         BCS L_A668
+         JSR $DEB8
+         PLA
+         TAY
+         PLA
+         STA $91
+         PLA
+         PLA
+         PLA
+         TAX
+         PLA
+         STA $8C
+         PLA
+         STA $8D
+         LDA $91
+         PHA
+         TYA
+         PHA
+         LDY #$00
+         TXA
+         BEQ L_A6F2
+         RTS
+         JSR $E6DC
+         JMP $E301
+         JSR $E5FD
+         LDX #$00
+         STX $11
+         TAY
+         RTS
+         JSR $E6DC
+         BEQ L_A6F2
+         LDY #$00
+         LDA ($5E),Y
+         TAY
+         JMP $E301
+L_A6F2
+         JMP $E199
+         JSR $00B1
+         JSR $DD67
+         JSR $E108
+         LDX $A0
+         BNE L_A6F2
+         LDX $A1
+         JMP $00B7
+         JSR $E6DC
+         BNE L_A70F
+         JMP $E84E
+L_A70F
+         LDX $B8
+         LDY $B9
+         STX $AD
+         STY $AE
+         LDX $5E
+         STX $B8
+         CLC
+         ADC $5E
+         STA $60
+         LDX $5F
+         STX $B9
+         BCC L_A727
+         INX
+L_A727
+         STX $61
+         LDY #$00
+         LDA ($60),Y
+         PHA
+         LDA #$00
+         STA ($60),Y
+         JSR $00B7
+         JSR $EC4A
+         PLA
+         LDY #$00
+         STA ($60),Y
+         LDX $AD
+         LDY $AE
+         STX $B8
+         STY $B9
+         RTS
+         JSR $DD67
+         JSR $E752
+         JSR $DEBE
+         JMP $E6F8
+         LDA $9D
+         CMP #$91
+         BCS L_A6F2
+         JSR $EBF2
+         LDA $A0
+         LDY $A1
+         STY $50
+         STA $51
+         RTS
+         LDA $50
+         PHA
+         LDA $51
+         PHA
+         JSR $E752
+         LDY #$00
+         LDA ($50),Y
+         TAY
+         PLA
+         STA $51
+         PLA
+         STA $50
+         JMP $E301
+         JSR $E746
+         TXA
+         LDY #$00
+         STA ($50),Y
+         RTS
+         JSR $E746
+         STX $85
+         LDX #$00
+         JSR $00B7
+         BEQ L_A793
+         JSR $E74C
+L_A793
+         STX $86
+         LDY #$00
+L_A797
+         LDA ($50),Y
+         EOR $86
+         AND $85
+         BEQ L_A797
+L_A79F
+         RTS
+         LDA #$64
+         LDY #$EE
+         JMP $E7BE
+         JSR $E9E3
+         LDA $A2
+         EOR #$FF
+         STA $A2
+         EOR $AA
+         STA $AB
+         LDA $9D
+         JMP $E7C1
+L_A7B9
+         JSR $E8F0
+         BCC L_A7FA
+         JSR $E9E3
+         BNE L_A7C6
+         JMP $EB53
+L_A7C6
+         LDX $AC
+         STX $92
+         LDX #$A5
+         LDA $A5
+         TAY
+         BEQ L_A79F
+         SEC
+         SBC $9D
+         BEQ L_A7FA
+         BCC L_A7EA
+         STY $9D
+         LDY $AA
+         STY $A2
+         EOR #$FF
+         ADC #$00
+         LDY #$00
+         STY $92
+         LDX #$9D
+         BNE L_A7EE
+L_A7EA
+         LDY #$00
+         STY $AC
+L_A7EE
+         CMP #$F9
+         BMI L_A7B9
+         TAY
+         LDA $AC
+         LSR $01,X
+         JSR $E907
+L_A7FA
+         BIT $AB
+         BPL $A855
+         LDY #$9D
+
+;=============================================================================
+; END OF APPLE PANIC
+;=============================================================================
