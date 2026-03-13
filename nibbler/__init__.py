@@ -15,6 +15,7 @@ Commands:
     boot      Emulate boot process and capture memory
     decode    Decode specific track/sector data
     dsk       Convert to standard DOS 3.3 DSK image
+    flux      Render magnetic flux patterns as a grayscale PNG
     disasm    Disassemble a binary or memory dump
 """
 

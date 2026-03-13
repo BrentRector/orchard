@@ -19,6 +19,7 @@ python -m nibbler <command> [arguments]
 | `boot`    | Emulate boot process, capture memory at stop point |
 | `decode`  | Decode a specific track/sector to hex dump or file |
 | `dsk`     | Convert WOZ to standard 140K DSK image             |
+| `flux`    | Render magnetic flux patterns as a grayscale PNG   |
 | `disasm`  | Disassemble a binary file or memory dump           |
 
 ---
@@ -278,6 +279,56 @@ Bootable DSK created: game.dsk
 
 ---
 
+## flux — Magnetic Flux Visualization
+
+Renders a top-down grayscale image of the disk's magnetic surface. Each track appears as a concentric ring where white pixels represent 1-bits (flux transitions) and black pixels represent 0-bits. The image is scaled to actual 5.25" floppy disk dimensions at the specified DPI.
+
+```
+python -m nibbler flux <woz_file> [-o output.png] [--dpi N] [--tracks N]
+```
+
+**Options:**
+- `-o FILE` — output PNG path (default: input filename with `_flux.png` suffix)
+- `--dpi N` — resolution in dots per inch (default 600). Higher DPI shows more flux detail but produces larger files.
+- `--tracks N` — number of track positions to render (default 35). Tracks without data appear as dark gray (blank media).
+
+**Requires:** `numpy` and `Pillow` (`pip install numpy Pillow`). These are optional dependencies only needed for this command.
+
+**Example:**
+
+```
+$ python -m nibbler flux "Apple Panic - Disk 1, Side A.woz"
+
+Rendering Apple Panic - Disk 1, Side A.woz at 600 DPI (35 tracks)...
+
+Tracks with data: 14
+  Track  0: 51107 bits
+  Track  1: 51125 bits
+  ...
+  Track 13: 51056 bits
+
+Saved Apple Panic - Disk 1, Side A_flux.png (3150x3150 px, 600 DPI)
+```
+
+**Image layout:**
+- **Outer black** — background (beyond the disk edge)
+- **Dark gray circle** — the disk's magnetic surface (5.25" diameter)
+- **Concentric rings** — track positions (track 0 outermost, track 34 innermost at default)
+  - Bright rings with visible patterns = tracks with recorded data
+  - Dark gray rings = unused/empty tracks
+- **Center black circle** — the spindle hole (1.5" diameter)
+
+**Physical dimensions:**
+The image models a standard 5.25" floppy disk: 48 TPI track pitch, track 0 at 2.25" radius, 1.5" spindle hole. At the default 600 DPI, each track is ~12.5 pixels wide. The flux bit density (~51,000 bits per track) far exceeds the pixel circumference, so each pixel represents the average of several bits — giving a realistic impression of the magnetic surface under magnification.
+
+**What to look for:**
+- **Uniform bright rings** — tracks with consistent data patterns (standard formatting)
+- **Varying brightness/texture across tracks** — different encoding schemes or data density
+- **Dark gap between data tracks and disk edge** — fewer tracks used than the 35-track standard
+- **Bright vs dark regions within a track** — sync byte runs (long 1-bit sequences) vs data areas
+
+---
+
 ## disasm — 6502 Disassembler
 
 Disassembles a binary file or memory dump as 6502 machine code. Supports both linear (sequential) and recursive descent (follows branches/jumps) modes.
@@ -333,6 +384,7 @@ from nibbler.disk import WOZDisk
 from nibbler.boot import BootAnalyzer
 from nibbler.analyze import CopyProtectionAnalyzer
 from nibbler.dsk import woz_to_dsk, create_bootable_dsk
+from nibbler.flux import render_flux_image
 from nibbler.disasm import Disassembler, disassemble_region
 ```
 
@@ -345,6 +397,7 @@ from nibbler.disasm import Disassembler, disassemble_region
 | `boot.py`    | `BootAnalyzer` — P6 ROM boot emulation, memory capture, snapshot saving, disk I/O tracing |
 | `analyze.py` | `CopyProtectionAnalyzer` — detect 8 protection techniques, generate markdown report, auto-detect non-standard prologs |
 | `dsk.py`     | `woz_to_dsk()`, `write_dsk()`, `create_bootable_dsk()`, DOS 3.3 VTOC/catalog reading |
+| `flux.py`    | `render_flux_image()` — grayscale magnetic flux visualization (requires numpy + Pillow) |
 | `disasm.py`  | `Disassembler` (recursive descent), `disassemble_region()` (linear), `OPCODES` table (all 256 including undocumented) |
 
 ---
@@ -357,17 +410,20 @@ from nibbler.disasm import Disassembler, disassemble_region
 # 1. What's on this disk?
 python -m nibbler info disk.woz
 
-# 2. What encoding and how many sectors?
+# 2. Visualize the magnetic surface
+python -m nibbler flux disk.woz
+
+# 3. What encoding and how many sectors?
 python -m nibbler scan disk.woz
 
-# 3. Any copy protection?
+# 4. Any copy protection?
 python -m nibbler protect disk.woz -o protection_report.md
 
-# 4. Look at specific sectors
+# 5. Look at specific sectors
 python -m nibbler decode disk.woz 0
 python -m nibbler decode disk.woz 0 --sector 0 -o boot_sector.bin
 
-# 5. Disassemble the boot sector
+# 6. Disassemble the boot sector
 python -m nibbler disasm boot_sector.bin --base 0x0800
 ```
 

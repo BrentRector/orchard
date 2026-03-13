@@ -9,6 +9,10 @@ build/
 # Script output directory
 apple-panic/output/
 
+# Large generated images (reproducible via nibbler flux)
+**/*_flux.png
+**/flux_image.png
+
 # Large emulation artifacts (reproducible via nibbler)
 boot_trace.log
 decoded_sectors/

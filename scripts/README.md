@@ -42,6 +42,7 @@ These scripts implement the final, verified decode pipeline for Apple Panic. Run
 | **build_runtime.py** | Build clean runtime memory image by simulating relocation copy loops. | 43,008-byte runtime image ($0000-$A7FF) |
 | **disassemble.py** | Generate full Merlin32-syntax assembly source from runtime image using recursive descent. | .asm file (~8,800 lines, 104 subroutines) |
 | **render_sprites.py** | Render player, enemy, font, and platform sprites from runtime image as PNGs. | `apple-panic/assets/*.png` (6 images) |
+| **woz_flux_image.py** | Render magnetic flux patterns as a top-down grayscale disk surface image. Wrapper around `nibbler flux`. | `apple-panic/flux_image.png` |
 
 ### Verification Scripts
 

@@ -43,11 +43,12 @@ python -m nibbler <command> <woz_file> [options]
 | `boot`    | Emulate 6502 boot process, capture memory at stop point |
 | `decode`  | Decode specific track/sector to hex dump or binary |
 | `dsk`     | Convert WOZ to standard 140K DSK image             |
+| `flux`    | Render magnetic flux patterns as a grayscale PNG   |
 | `disasm`  | Disassemble 6502 binary (linear or recursive descent) |
 
-**11 modules:** WOZ2 parser, GCR 6-and-2 / 5-and-3 codec with auto-detection of non-standard address prologs, full NMOS 6502 emulator (all 256 opcodes including 29 undocumented), Disk II controller simulation with stepper motor and I/O tracing, boot emulation framework, copy protection analyzer, DSK converter, and 6502 disassembler with recursive descent.
+**12 modules:** WOZ2 parser, GCR 6-and-2 / 5-and-3 codec with auto-detection of non-standard address prologs, full NMOS 6502 emulator (all 256 opcodes including 29 undocumented), Disk II controller simulation with stepper motor and I/O tracing, boot emulation framework, copy protection analyzer, DSK converter, magnetic flux visualizer, and 6502 disassembler with recursive descent.
 
-No external dependencies. Python 3.10+.
+No external dependencies for core functionality. Python 3.10+. The `flux` command additionally requires numpy and Pillow.
 
 See [`nibbler/USAGE.md`](nibbler/USAGE.md) for detailed usage with examples.
 
@@ -62,6 +63,9 @@ python -m nibbler scan "apple-panic/Apple Panic - Disk 1, Side A.woz"
 
 # Detect copy protection techniques
 python -m nibbler protect "apple-panic/Apple Panic - Disk 1, Side A.woz"
+
+# Visualize the magnetic flux patterns
+python -m nibbler flux "apple-panic/Apple Panic - Disk 1, Side A.woz"
 
 # Boot-trace and extract the game binary
 python -m nibbler boot "apple-panic/Apple Panic - Disk 1, Side A.woz" \

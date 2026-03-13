@@ -347,6 +347,26 @@ def cmd_dsk(args):
             print(f"  Track {t}: sectors {by_track[t]}")
 
 
+def cmd_flux(args):
+    """Render a top-down grayscale image of the disk's magnetic flux patterns."""
+    from .flux import render_flux_image
+
+    dpi = args.dpi or 600
+    num_tracks = args.tracks or 35
+    output = args.output or args.woz_file.rsplit('.', 1)[0] + '_flux.png'
+
+    print(f"Rendering {args.woz_file} at {dpi} DPI ({num_tracks} tracks)...")
+    track_data = render_flux_image(args.woz_file, output, dpi=dpi,
+                                   num_tracks=num_tracks)
+
+    print(f"\nTracks with data: {len(track_data)}")
+    for tn, bits in track_data:
+        print(f"  Track {tn:2d}: {bits} bits")
+
+    image_px = int(5.25 * dpi)
+    print(f"\nSaved {output} ({image_px}x{image_px} px, {dpi} DPI)")
+
+
 def cmd_disasm(args):
     """Disassemble a binary file or memory dump."""
     from .disasm import disassemble_region, Disassembler, add_hardware_comments, OPCODES
@@ -439,6 +459,13 @@ def main():
     p_dsk.add_argument('--load-addr', help='Load address for binary (hex)')
     p_dsk.add_argument('--entry-addr', help='Entry address for binary (hex)')
 
+    # flux
+    p_flux = subparsers.add_parser('flux', help='Render magnetic flux visualization as PNG')
+    p_flux.add_argument('woz_file', help='Path to WOZ2 disk image')
+    p_flux.add_argument('-o', '--output', help='Output PNG path')
+    p_flux.add_argument('--dpi', type=int, help='Resolution in DPI (default 600)')
+    p_flux.add_argument('--tracks', type=int, help='Number of track positions to show (default 35)')
+
     # disasm
     p_disasm = subparsers.add_parser('disasm', help='Disassemble binary')
     p_disasm.add_argument('binary', help='Binary file to disassemble')
@@ -464,6 +491,7 @@ def main():
         'boot': cmd_boot,
         'decode': cmd_decode,
         'dsk': cmd_dsk,
+        'flux': cmd_flux,
         'disasm': cmd_disasm,
     }
 

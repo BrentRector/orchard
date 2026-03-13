@@ -13,6 +13,7 @@ Example::
 
     python -m nibbler info  game.woz
     python -m nibbler scan  game.woz
+    python -m nibbler flux  game.woz -o disk_surface.png
     python -m nibbler boot  game.woz --stop 0x4000 --dump 0x4000-0xA7FF
 """
 from .cli import main
